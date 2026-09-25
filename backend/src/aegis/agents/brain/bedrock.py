@@ -20,6 +20,7 @@ fallback model - the next tier is the retry.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Final
@@ -216,6 +217,11 @@ class BedrockBrain:
             kwargs["aws_secret_key"] = secret
         elif s.aws_profile:
             kwargs["aws_profile"] = s.aws_profile
+        elif os.environ.get("AWS_PROFILE", None) == "":
+            # botocore reads an empty AWS_PROFILE as a profile literally named
+            # "" and fails with ProfileNotFound instead of falling through to
+            # the task role - which is exactly the deployed case.
+            os.environ.pop("AWS_PROFILE", None)
         # Otherwise botocore's default chain (env, SSO cache, task role).
         self._client = anthropic.AsyncAnthropicBedrock(**kwargs)
         return self._client

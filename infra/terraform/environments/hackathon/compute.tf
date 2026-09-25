@@ -39,7 +39,6 @@ locals {
     # The brain: Bedrock through the task role (botocore's default chain, no
     # keys, no profile), primary model with a verified fallback.
     AWS_REGION                = var.aws_region
-    AWS_PROFILE               = ""
     BEDROCK_MODEL_ID          = var.bedrock_model_id
     BEDROCK_FALLBACK_MODEL_ID = var.bedrock_fallback_model_id
     AEGIS_MODE                = "live"

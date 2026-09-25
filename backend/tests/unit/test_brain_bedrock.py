@@ -252,3 +252,31 @@ async def test_no_secret_in_status_or_error_text() -> None:
     assert SENTINEL_SECRET not in blob
     assert "AKIASENTINEL" not in blob
     assert brain.status()["auth"] == "access-keys"
+
+
+def test_an_empty_aws_profile_falls_through_to_the_task_role(monkeypatch):
+    # On ECS the task role is the credential. botocore reads AWS_PROFILE=""
+    # as a profile named "" and raises ProfileNotFound, so every Bedrock call
+    # failed in the deployed environment until this was handled.
+    import anthropic
+
+    from aegis.agents.brain.bedrock import BedrockBrain
+    from aegis.core.config import Settings
+
+    captured: dict = {}
+
+    class _Recorder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("AWS_PROFILE", "")
+    monkeypatch.setattr(anthropic, "AsyncAnthropicBedrock", _Recorder)
+    brain = BedrockBrain(
+        Settings(_env_file=None, aws_region="us-west-2", bedrock_model_id="m", aws_profile="")  # type: ignore[call-arg]
+    )
+    brain._get_client()
+
+    assert "aws_profile" not in captured
+    import os
+
+    assert "AWS_PROFILE" not in os.environ
