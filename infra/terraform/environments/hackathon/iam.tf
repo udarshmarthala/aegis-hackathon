@@ -275,7 +275,13 @@ data "aws_iam_policy_document" "github_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:environment:${var.github_environment}"]
+      # GitHub issues either the classic subject or, for repositories with
+      # immutable subjects enabled, one carrying the owner and repository ids
+      # (so a renamed or re-created repo cannot inherit this role).
+      values = compact([
+        "repo:${var.github_repository}:environment:${var.github_environment}",
+        var.github_immutable_sub_prefix == "" ? "" : "${var.github_immutable_sub_prefix}:environment:${var.github_environment}",
+      ])
     }
   }
 }

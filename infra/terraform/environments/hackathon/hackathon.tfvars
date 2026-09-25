@@ -25,9 +25,9 @@ aegis_env = "production"
 # FIRST apply: no image exists at "bootstrap", so both services start at 0 and
 # the first deploy-hackathon run (bring_up = true) starts them. After that run,
 # set both counts to 1 and image_tag to the deployed commit SHA, then re-apply.
-image_tag            = "bootstrap"
-api_desired_count    = 0
-worker_desired_count = 0
+image_tag            = "7c30275fe7480627d9b2dec7fb7cc15256337d38"
+api_desired_count    = 1
+worker_desired_count = 1
 
 cpu_architecture = "ARM64"
 api_cpu          = 512
@@ -59,6 +59,7 @@ neo4j_uri = ""
 
 github_repository           = "udarshmarthala/aegis-hackathon"
 github_environment          = "aegis-hackathon"
+github_immutable_sub_prefix = "repo:udarshmarthala@103487639/aegis-hackathon@1388138462"
 create_github_oidc_provider = true
 
 budget_limit_usd = 100

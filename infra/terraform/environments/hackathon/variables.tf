@@ -383,3 +383,9 @@ variable "budget_emails" {
   type        = list(string)
   default     = []
 }
+
+variable "github_immutable_sub_prefix" {
+  description = "Immutable OIDC subject prefix, e.g. repo:owner@<owner_id>/repo@<repo_id> (from GET /repos/{repo}/actions/oidc/customization/sub). Empty when the repo uses classic subjects."
+  type        = string
+  default     = ""
+}

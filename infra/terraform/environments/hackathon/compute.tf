@@ -26,11 +26,13 @@ locals {
 
     # Not run on AWS. Each points at a name that cannot resolve, so the client
     # fails fast and the capability is reported unavailable with a reason.
-    REDIS_HOST     = local.absent
-    NEO4J_URI      = var.neo4j_uri != "" ? var.neo4j_uri : "bolt://${local.absent}:7687"
-    PROMETHEUS_URL = "http://${local.absent}:9090"
-    TEMPO_URL      = "http://${local.absent}:3200"
-    LOKI_URL       = "http://${local.absent}:3100"
+    # Empty means "not deployed": the app skips the connection entirely and
+    # reports each as unconfigured rather than as a dependency that is down.
+    REDIS_HOST     = ""
+    NEO4J_URI      = var.neo4j_uri
+    PROMETHEUS_URL = ""
+    TEMPO_URL      = ""
+    LOKI_URL       = ""
     # No collector to export to; exporting into the void costs retries.
     OTEL_TRACES_ENABLED = "false"
 

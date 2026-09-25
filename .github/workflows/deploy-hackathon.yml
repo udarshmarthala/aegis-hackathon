@@ -359,6 +359,9 @@ jobs:
     needs: deploy
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # The HACKATHON_* variables are environment-scoped; without this the job
+    # sees them empty and smoke-tests an empty URL.
+    environment: aegis-hackathon
     steps:
       - uses: actions/checkout@v4
 

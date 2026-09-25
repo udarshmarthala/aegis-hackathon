@@ -53,7 +53,10 @@ fi
 # Degraded is acceptable: an unreachable Prometheus is a recorded evidence gap,
 # not an outage (CLAUDE.md invariant 9). "unavailable" is not acceptable — that
 # means the system of record is gone.
-if printf '%s' "${health_body}" | grep -q '"status": *"unavailable"'; then
+# Only the top-level status: components that are not deployed report their own
+# state, and matching any "unavailable" anywhere read those as an outage.
+top_status="$(printf '%s' "${health_body}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)"
+if [ "${top_status}" = "unavailable" ] || [ -z "${top_status}" ]; then
   fail "/health reports status=unavailable (Postgres unreachable)"
 else
   pass "/health status is healthy or degraded"
