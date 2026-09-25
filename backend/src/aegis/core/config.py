@@ -203,6 +203,75 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     ecs_cluster: str = ""
 
+    # --- long-horizon agent: mode and driver ---
+    # ``scripted`` runs the golden path with no network at all: the scripted
+    # brain, the rule compactor and fixture-backed sponsors. ``live`` tries the
+    # real providers first and falls back tier by tier, labelling each fallback.
+    aegis_mode: Literal["live", "scripted"] = "scripted"
+    # Which orchestrator drives an investigation job. Both stay in the tree; the
+    # horizon step loop is the default incident driver.
+    horizon_driver: Literal["horizon", "langgraph"] = "horizon"
+    horizon_max_steps: Annotated[int, Field(ge=4, le=500)] = 80
+    horizon_step_timeout_s: float = Field(default=120.0, gt=0)
+    verification_sustained_samples: Annotated[int, Field(ge=1, le=30)] = 5
+    verification_sample_interval_s: float = Field(default=3.0, gt=0)
+
+    # --- Bedrock (the brain) ---
+    aws_profile: str = ""
+    aws_access_key_id: SecretStr = SecretStr("")
+    aws_secret_access_key: SecretStr = SecretStr("")
+    # Verified against ``aws bedrock list-inference-profiles``. The fallback id is
+    # a second Bedrock model tried when the primary is denied for the account
+    # (403), so the brain stays on Bedrock rather than dropping a whole tier.
+    bedrock_model_id: str = ""
+    bedrock_fallback_model_id: str = ""
+    bedrock_timeout_s: float = Field(default=60.0, gt=0)
+    bedrock_max_tokens: Positive = 4096
+
+    # --- Gemini key pools (N keys, two named pools) ---
+    # Slots are 1-based: GOOGLE_API_KEY is slot 1, GOOGLE_API_KEY_2..8 follow.
+    # Each pool names the slots it may use, so a Bedrock outage that pushes the
+    # brain onto Gemini cannot starve compaction of quota.
+    google_api_key_5: SecretStr = SecretStr("")
+    google_api_key_6: SecretStr = SecretStr("")
+    google_api_key_7: SecretStr = SecretStr("")
+    google_api_key_8: SecretStr = SecretStr("")
+    gemini_compactor_keys: str = "1,2,3,4,5"
+    gemini_brain_keys: str = "6,7,8"
+
+    # --- RawTree (episodic memory, heartbeat, agent history) ---
+    rawtree_write_key: SecretStr = SecretStr("")
+    rawtree_read_key: SecretStr = SecretStr("")
+    rawtree_database: str = ""
+    rawtree_api_url: str = "https://api.rawtree.com"
+    rawtree_mcp_url: str = "https://mcp.rawtree.com/mcp"
+    rawtree_flush_interval_ms: Positive = 500
+    rawtree_queue_max: Positive = 5000
+    rawtree_timeout_s: float = Field(default=8.0, gt=0)
+
+    # --- Nimble (external evidence) ---
+    nimble_api_key: SecretStr = SecretStr("")
+    nimble_mcp_url: str = "https://mcp.nimbleway.com/mcp"
+    nimble_timeout_s: float = Field(default=8.0, gt=0)
+
+    # --- Black Forest Labs (incident map) ---
+    bfl_api_key: SecretStr = SecretStr("")
+    bfl_api_url: str = "https://api.bfl.ai/v1"
+    bfl_model: str = "flux-pro-1.1"
+    bfl_timeout_s: float = Field(default=60.0, gt=0)
+
+    # --- heartbeat and metrics forwarder (run inside the worker) ---
+    heartbeat_interval_s: float = Field(default=5.0, gt=0)
+    heartbeat_zscore_threshold: float = Field(default=3.0, gt=0)
+    forwarder_interval_s: float = Field(default=5.0, gt=0)
+    # service=url pairs scraped by the forwarder; the workload exposes
+    # Prometheus text on /metrics.
+    workload_metrics_targets: str = (
+        "gateway=http://gateway:8080/metrics,"
+        "checkout=http://checkout:8080/metrics,"
+        "payment=http://payment:8080/metrics"
+    )
+
     # ------------------------------------------------------------------ #
     # Derived accessors                                                   #
     # ------------------------------------------------------------------ #
@@ -279,6 +348,51 @@ class Settings(BaseSettings):
                 seen.append(value)
         return tuple(seen)
 
+    def _google_slot_secrets(self) -> tuple[SecretStr, ...]:
+        """All eight key slots, slot 1 first. Empty slots stay in place."""
+        return (
+            self.google_api_key,
+            self.google_api_key_2,
+            self.google_api_key_3,
+            self.google_api_key_4,
+            self.google_api_key_5,
+            self.google_api_key_6,
+            self.google_api_key_7,
+            self.google_api_key_8,
+        )
+
+    def gemini_pool_keys(self, pool: Literal["compactor", "brain"]) -> tuple[str, ...]:
+        """The configured keys for one named pool, in slot order, deduplicated.
+
+        A slot named by the pool but left empty is skipped, so an operator can
+        start with two keys and add the rest later without touching the pool
+        lists. Deduplicated for the same reason as ``google_api_keys``: one key
+        pasted twice is not two quotas.
+        """
+        spec = self.gemini_compactor_keys if pool == "compactor" else self.gemini_brain_keys
+        secrets = self._google_slot_secrets()
+        seen: list[str] = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            value = secrets[int(part) - 1].get_secret_value().strip()
+            if value and value not in seen:
+                seen.append(value)
+        return tuple(seen)
+
+    @property
+    def metrics_targets(self) -> dict[str, str]:
+        """``service -> /metrics URL`` for the RawTree forwarder."""
+        out: dict[str, str] = {}
+        for part in self.workload_metrics_targets.split(","):
+            if "=" not in part:
+                continue
+            service, url = part.split("=", 1)
+            if service.strip() and url.strip():
+                out[service.strip()] = url.strip()
+        return out
+
     @property
     def is_production(self) -> bool:
         return self.aegis_env is Environment.PRODUCTION
@@ -298,6 +412,17 @@ class Settings(BaseSettings):
                 raise ValueError(f"autonomy tier {part!r} must be an integer 0-3")
             if int(part) == 3:
                 raise ValueError("tier 3 can never be autonomous (PRD FR-12)")
+        return v
+
+    @field_validator("gemini_compactor_keys", "gemini_brain_keys")
+    @classmethod
+    def _pool_slots_parse(cls, v: str) -> str:
+        for part in v.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit() or not 1 <= int(part) <= 8:
+                raise ValueError(f"gemini key slot {part!r} must be an integer 1-8")
         return v
 
     @model_validator(mode="after")
