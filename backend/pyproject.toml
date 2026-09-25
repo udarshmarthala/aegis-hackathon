@@ -48,7 +48,7 @@ dependencies = [
   # supply-chain gate, not a reachability argument, and the fix is a version
   # bump with no API change. Remove this line once cachecontrol raises its own
   # floor past 1.2.1.
-  "msgpack>=1.2.1",
+  "msgpack>=1.2.2",
 ]
 
 [project.optional-dependencies]
