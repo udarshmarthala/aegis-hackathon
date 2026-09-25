@@ -365,7 +365,7 @@ services:
 
   # Continuous traffic so the metrics Aegis queries actually exist.
   loadgen:
-    image: alpine:3.21
+    image: alpine:3.24
     <<: *restart
     profiles: ["workload"]
     depends_on: [gateway]
