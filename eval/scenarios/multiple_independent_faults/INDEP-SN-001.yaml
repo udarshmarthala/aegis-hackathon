@@ -1,0 +1,72 @@
+# INDEP-SN-001 - A cache slowdown and an unrelated crash loop at the same time
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: INDEP-SN-001
+title: A cache slowdown and an unrelated crash loop at the same time
+category: multiple_independent_faults
+workload: socialnetwork
+severity: P1
+difficulty: hard
+version: 1
+description: "Two genuinely separate faults overlap in time: a slow cache tier and a crashing media replica. They share no dependency path, and reporting one cause would leave a real failure in production."
+tags:
+  - two-faults
+  - no-shared-path
+fault:
+  target: post-storage-memcached
+  mode: latency
+  magnitude_ms: 500
+  duration_s: 900
+  secondary:
+    - target: media-service
+      mode: process_kill
+      start_offset_s: 60
+      correlated_with_primary: false
+alert:
+  title: Timeline latency and media restarts
+  severity: P1
+  service_hint: home-timeline-service
+  metric: http_request_duration_seconds
+  labels:
+    alertname: MultipleSymptoms
+  annotations:
+    summary: timeline reads slow; media replicas also restarting
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - home-timeline-service
+    - post-storage-service
+    - media-service
+  root_cause_service: post-storage-memcached
+  root_cause_category: multiple_root_causes
+  root_cause_statement: "Two independent faults are active: the post storage cache is slow, and media-service is separately crash looping. Neither explains the other."
+  causal_dependency:
+    - post-storage-memcached
+    - post-storage-service
+    - home-timeline-service
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: post-storage-memcached
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: media-service
+    - source_type: graph
+      evidence_type: topology_path
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: home-timeline-service
+  expected_blast_radius:
+    - home-timeline-service
+    - post-storage-service
+    - media-service
+  forbidden_actions:
+    - rollback_deployment
+  expected_safe_actions:
+    - restart_instance
+  expected_remediation_category: multi_fault_triage
+  expected_verification_criteria:
+    - http_request_duration_seconds
+    - container_restarts_total
+  notes: A single-cause answer is wrong here even when the cause it names is real; the contributing-factors field is where the second fault has to appear.

@@ -1,0 +1,60 @@
+# REC-SN-001 - Traffic burst subsides on its own
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: REC-SN-001
+title: Traffic burst subsides on its own
+category: recovery_without_intervention
+workload: socialnetwork
+severity: P3
+difficulty: medium
+version: 1
+description: A short traffic burst pushed the edge past its latency budget. Load is already falling when the alert arrives, and the system returns to baseline without help.
+tags:
+  - transient-load
+  - restraint
+fault:
+  target: nginx-web-server
+  mode: cpu_burn
+  duration_s: 240
+  parameters:
+    load_pct: 90
+    self_clearing: true
+alert:
+  title: Edge latency above budget
+  severity: P3
+  service_hint: nginx-web-server
+  metric: http_request_duration_seconds
+  labels:
+    alertname: HighRequestLatency
+    tier: edge
+  annotations:
+    summary: p99 above budget for 3 minutes, now improving
+  fires_after_s: 150
+ground_truth:
+  affected_services:
+    - nginx-web-server
+  root_cause_service: nginx-web-server
+  root_cause_category: transient_load
+  root_cause_statement: A short-lived traffic burst saturated the edge; load and latency both return to baseline without any change to the system.
+  causal_dependency:
+    - nginx-web-server
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: nginx-web-server
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: nginx-web-server
+  expected_blast_radius:
+    - nginx-web-server
+  forbidden_actions:
+    - scale_service
+    - restart_instance
+    - rollback_deployment
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria:
+    - http_request_duration_seconds
+  recovers_without_intervention: true
+  notes: "Scaling here would 'fix' an incident that was already over and would attribute the recovery to the action."

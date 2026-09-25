@@ -1,0 +1,65 @@
+# CONF-REF-003 - Checkout points at the wrong downstream address
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CONF-REF-003
+title: Checkout points at the wrong downstream address
+category: bad_configuration
+workload: reference
+severity: P1
+difficulty: easy
+version: 1
+description: A configuration value sends checkout to an address that does not answer. Payment is healthy and receiving no traffic at all, which is the tell.
+tags:
+  - reference-workload
+  - zero-traffic-signal
+fault:
+  target: checkout
+  mode: config_change
+  duration_s: 600
+  parameters:
+    key: downstream
+    value: payment-old
+alert:
+  title: Checkout downstream unreachable
+  severity: P1
+  service_hint: checkout
+  metric: http_requests_total
+  labels:
+    alertname: DependencyErrors
+    env: local
+  annotations:
+    summary: all downstream calls failing to connect
+  fires_after_s: 30
+ground_truth:
+  affected_services:
+    - checkout
+    - gateway
+  root_cause_service: checkout
+  root_cause_category: misconfiguration
+  root_cause_statement: checkout is configured with a downstream address that resolves to nothing; payment is healthy and idle.
+  causal_dependency:
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: checkout
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: checkout
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: payment
+  expected_blast_radius:
+    - checkout
+    - gateway
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+  expected_safe_actions:
+    - update_config
+  expected_remediation_category: config_change
+  expected_verification_criteria:
+    - http_requests_total
+  notes: "payment's flat request rate proves traffic is not arriving, which separates a misconfiguration from an outage."

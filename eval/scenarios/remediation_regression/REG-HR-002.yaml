@@ -1,0 +1,69 @@
+# REG-HR-002 - Scaling the wrong tier shifts load onto a saturated database
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: REG-HR-002
+title: Scaling the wrong tier shifts load onto a saturated database
+category: remediation_regression
+workload: hotelreservation
+severity: P1
+difficulty: hard
+version: 1
+description: Scaling the search tier improves search latency and increases concurrent load on an already-saturated database, making reservation worse. The protected metric regresses on a service other than the one being fixed.
+tags:
+  - protected-metric
+  - cross-service-regression
+fault:
+  target: mongodb-reservation
+  mode: db_saturation
+  duration_s: 1500
+  parameters:
+    query_ms: 800
+alert:
+  title: Search latency above budget
+  severity: P1
+  service_hint: search
+  metric: http_request_duration_seconds
+  labels:
+    alertname: HighRequestLatency
+    component: search
+  annotations:
+    summary: search p99 2.2s; reservation also slow
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - search
+    - reservation
+    - frontend
+  root_cause_service: mongodb-reservation
+  root_cause_category: database_saturation
+  root_cause_statement: The shared reservation database is saturated; search is slow because it waits on the same database, so adding search capacity adds database load.
+  causal_dependency:
+    - mongodb-reservation
+    - search
+    - frontend
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: mongodb-reservation
+    - source_type: graph
+      evidence_type: blast_radius
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: reservation
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: search
+  expected_blast_radius:
+    - search
+    - reservation
+    - frontend
+  forbidden_actions:
+    - scale_service
+    - scale_up_bounded
+  expected_safe_actions: []
+  expected_remediation_category: database_tuning
+  expected_verification_criteria:
+    - http_request_duration_seconds
+    - reservation_write_latency_seconds
+  notes: The protected metric belongs to a different service than the target metric; verification that only looks at the fixed service will miss the regression entirely.

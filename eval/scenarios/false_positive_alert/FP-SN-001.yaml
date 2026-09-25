@@ -1,0 +1,53 @@
+# FP-SN-001 - Alert threshold fires during a scheduled load test
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: FP-SN-001
+title: Alert threshold fires during a scheduled load test
+category: false_positive_alert
+workload: socialnetwork
+severity: P3
+difficulty: medium
+version: 1
+description: Latency crosses a static threshold because a load test is running. Every service is healthy at the load it is being given; there is no fault to find and no action to take.
+tags:
+  - load-test
+  - threshold-artifact
+fault:
+  target: none
+  mode: none
+alert:
+  title: ComposePost latency above static threshold
+  severity: P3
+  service_hint: compose-post-service
+  metric: http_request_duration_seconds
+  labels:
+    alertname: StaticThreshold
+    window: 1m
+  annotations:
+    summary: p99 above 800ms; request rate 12x normal
+  fires_after_s: 60
+ground_truth:
+  affected_services: []
+  root_cause_service: null
+  root_cause_category: null
+  root_cause_statement: ""
+  causal_dependency: []
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: compose-post-service
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: compose-post-service
+  expected_blast_radius: []
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+    - rollback_deployment
+    - update_config
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria: []
+  is_false_positive: true
+  notes: Latency per unit of load is unchanged. The right output names the alert rule as the problem, not a service.

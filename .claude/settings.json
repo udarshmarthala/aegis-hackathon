@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "enabledPlugins": {
+    "ecc@ecc": true,
+    "frontend-design@claude-plugins-official": true,
+    "figma@claude-plugins-official": true,
+    "impeccable@impeccable": true
+  },
+  "enableAllProjectMcpServers": true,
+  "env": {
+    "ECC_GATEGUARD": "on",
+    "GRAPHIFY_GRAPH": "graphify-out/graph.json"
+  },
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.secrets/**)",
+      "Read(./**/*.pem)",
+      "Read(./**/serviceAccount*.json)"
+    ]
+  }
+}

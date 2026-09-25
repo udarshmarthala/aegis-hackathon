@@ -1,0 +1,400 @@
+# Deploy to staging.
+#
+# Triggered by a successful `docker` run on main, so an image is guaranteed to
+# exist and to have passed the trivy gate before anything is deployed.
+#
+# Ordering is deliberate and is the whole point of this file:
+#
+#   terraform apply  -> registers new task definition revisions. Services are
+#                       NOT touched: aws_ecs_service ignores changes to
+#                       task_definition and desired_count.
+#   migrate          -> a one-off Fargate task on the NEW image, run to
+#                       completion, before any serving task sees the new code.
+#   deploy           -> update-service to the new revision, wait for stability.
+#   smoke            -> assert liveness, readiness and the auth boundary.
+#
+# Every job is idempotent, so "Re-run failed jobs" resumes a partial deploy
+# rather than starting over. A destructive plan stops at a separate GitHub
+# Environment with its own reviewers.
+name: deploy-staging
+
+on:
+  workflow_run:
+    workflows: [docker]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (default: current main SHA)"
+        type: string
+        required: false
+      skip_terraform:
+        description: "Skip terraform plan/apply (infrastructure unchanged)"
+        type: boolean
+        default: false
+      skip_migrations:
+        description: "Skip the one-off migration task"
+        type: boolean
+        default: false
+
+# Never cancel a deploy in flight: a cancelled apply leaves state locked and a
+# cancelled rollout leaves a service on two revisions.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_DIR: infra/terraform/environments/staging
+
+jobs:
+  # ------------------------------------------------------------ preflight ---
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A docker run that failed must not deploy. workflow_run fires on
+    # completion, not on success, so this guard is load bearing.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      configured: ${{ steps.resolve.outputs.configured }}
+    steps:
+      - name: Resolve deploy target
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          sha="${RUN_SHA:-${GITHUB_SHA}}"
+          tag="${INPUT_TAG:-${sha}}"
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          if [ -z "${ROLE}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Deploy skipped::vars.AWS_DEPLOY_ROLE_ARN is unset; no AWS account is attached."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "deploying image tag ${tag} (commit ${sha})"
+
+  # ----------------------------------------------------------------- plan ---
+  plan:
+    name: terraform plan
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true' && !inputs.skip_terraform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      destructive: ${{ steps.inspect.outputs.destructive }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-staging-plan-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -no-color -input=false -out=tfplan \
+            -var="image_tag=${{ needs.preflight.outputs.image_tag }}"
+
+      # A plan that deletes or replaces anything does not proceed on its own.
+      # "Replace" is included on purpose: replacing an RDS instance is a data
+      # loss event wearing an update's clothing.
+      - name: Inspect plan for destructive actions
+        id: inspect
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform show -json tfplan > plan.json
+          destroyed="$(jq -r '
+            [.resource_changes[]
+             | select(.change.actions | index("delete"))
+             | .address] | join(", ")' plan.json)"
+          if [ -n "${destroyed}" ]; then
+            echo "destructive=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Destructive plan::${destroyed}"
+            {
+              echo "### Destructive changes in the staging plan"
+              echo
+              echo '```'
+              echo "${destroyed}" | tr ',' '\n'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "destructive=false" >> "$GITHUB_OUTPUT"
+            echo "plan contains no delete or replace actions"
+          fi
+
+      # The saved plan is what gets applied, so review and execution cannot
+      # diverge between the gate and the apply.
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-tfplan-${{ github.run_id }}
+          path: |
+            ${{ env.TF_DIR }}/tfplan
+            ${{ env.TF_DIR }}/plan.json
+          retention-days: 5
+
+  # ------------------------------------------------- destructive approval ---
+  # Configure this GitHub Environment with required reviewers. It exists only
+  # to interrupt: it runs nothing.
+  approve-destructive:
+    name: approve destructive changes
+    needs: [preflight, plan]
+    if: needs.plan.outputs.destructive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1440
+    environment: aegis-staging-destructive
+    steps:
+      - name: Record approval
+        run: |
+          echo "Destructive staging changes approved by ${GITHUB_ACTOR} for run ${GITHUB_RUN_ID}."
+
+  # ---------------------------------------------------------------- apply ---
+  apply:
+    name: terraform apply
+    needs: [preflight, plan, approve-destructive]
+    # skipped != failed. approve-destructive is skipped on a clean plan, and a
+    # skipped gate must not block the deploy.
+    if: >-
+      always() &&
+      needs.preflight.outputs.configured == 'true' &&
+      (needs.plan.result == 'success' || needs.plan.result == 'skipped') &&
+      (needs.approve-destructive.result == 'success' || needs.approve-destructive.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment:
+      name: aegis-staging
+      url: ${{ steps.outputs.outputs.api_url }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      cluster: ${{ steps.outputs.outputs.cluster }}
+      api_service: ${{ steps.outputs.outputs.api_service }}
+      worker_service: ${{ steps.outputs.outputs.worker_service }}
+      api_taskdef: ${{ steps.outputs.outputs.api_taskdef }}
+      worker_taskdef: ${{ steps.outputs.outputs.worker_taskdef }}
+      migrate_taskdef: ${{ steps.outputs.outputs.migrate_taskdef }}
+      subnets: ${{ steps.outputs.outputs.subnets }}
+      security_group: ${{ steps.outputs.outputs.security_group }}
+      log_group: ${{ steps.outputs.outputs.log_group }}
+      api_url: ${{ steps.outputs.outputs.api_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-staging-apply-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Download plan
+        if: needs.plan.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: staging-tfplan-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}
+
+      # Applying the saved plan, not re-planning: the reviewed change set is
+      # the applied change set.
+      - name: terraform apply
+        if: needs.plan.result == 'success'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Read outputs
+        id: outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -euo pipefail
+          terraform output -json > out.json
+          get() { jq -r --arg k "$1" '.[$k].value // empty' out.json; }
+          {
+            echo "cluster=$(get ecs_cluster_name)"
+            echo "api_service=$(get api_service_name)"
+            echo "worker_service=$(get worker_service_name)"
+            echo "api_taskdef=$(get api_task_definition_arn)"
+            echo "worker_taskdef=$(get worker_task_definition_arn)"
+            echo "migrate_taskdef=$(get migrate_task_definition_arn)"
+            echo "subnets=$(jq -r '.task_subnet_ids.value | join(",")' out.json)"
+            echo "security_group=$(get task_security_group_id)"
+            echo "log_group=$(get log_group_name)"
+            echo "api_url=$(get api_base_url)"
+          } >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------- migrate ---
+  # Runs on the NEW image, to completion, before any serving task is updated.
+  # The runner also applies migrations at boot behind a Postgres advisory lock,
+  # so this task racing a straggler task is safe by construction.
+  migrate:
+    name: run migrations
+    needs: [preflight, apply]
+    if: always() && needs.apply.result == 'success' && !inputs.skip_migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: aegis-staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-staging-migrate-${{ github.run_id }}
+
+      - name: Run migration task
+        run: |
+          bash scripts/ci/run-ecs-task.sh \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --task-definition "${{ needs.apply.outputs.migrate_taskdef }}" \
+            --subnets "${{ needs.apply.outputs.subnets }}" \
+            --security-groups "${{ needs.apply.outputs.security_group }}" \
+            --log-group "${{ needs.apply.outputs.log_group }}" \
+            --log-prefix "migrate" \
+            --container "migrate" \
+            --timeout-seconds 900
+
+  # --------------------------------------------------------------- deploy ---
+  deploy:
+    name: roll out services
+    needs: [preflight, apply, migrate]
+    if: >-
+      always() && needs.apply.result == 'success' &&
+      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: aegis-staging
+      url: ${{ needs.apply.outputs.api_url }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-staging-deploy-${{ github.run_id }}
+
+      # Record the revision currently serving before changing anything. This is
+      # the rollback target, printed into the job summary where an operator can
+      # find it without reading Terraform state.
+      - name: Record rollback target
+        run: |
+          set -euo pipefail
+          prev="$(aws ecs describe-services \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --services "${{ needs.apply.outputs.api_service }}" \
+            --query 'services[0].taskDefinition' --output text)"
+          echo "previous API task definition: ${prev}"
+          echo "PREV_API_TASKDEF=${prev}" >> "$GITHUB_ENV"
+
+      - name: Update API service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --service "${{ needs.apply.outputs.api_service }}" \
+            --task-definition "${{ needs.apply.outputs.api_taskdef }}" \
+            --query 'service.taskDefinition' --output text
+
+      - name: Update worker service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --service "${{ needs.apply.outputs.worker_service }}" \
+            --task-definition "${{ needs.apply.outputs.worker_taskdef }}" \
+            --query 'service.taskDefinition' --output text
+
+      # services-stable polls for up to ~40 minutes. A rollout that never
+      # stabilises fails the job with the deployment still in the console for
+      # diagnosis, rather than passing on a timeout.
+      - name: Wait for services to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --services "${{ needs.apply.outputs.api_service }}" \
+                       "${{ needs.apply.outputs.worker_service }}"
+
+      - name: Publish rollback instructions
+        if: always()
+        run: |
+          {
+            echo "### Rollback (staging)"
+            echo
+            echo "Previous API task definition: ${PREV_API_TASKDEF:-unknown}"
+            echo
+            echo "    aws ecs update-service --cluster ${{ needs.apply.outputs.cluster }} \\"
+            echo "      --service ${{ needs.apply.outputs.api_service }} \\"
+            echo "      --task-definition ${PREV_API_TASKDEF:-<previous-revision>}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- smoke ---
+  smoke:
+    name: smoke tests
+    needs: [apply, deploy]
+    if: always() && needs.deploy.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke test the deployed API
+        run: bash scripts/ci/smoke-test.sh "${{ needs.apply.outputs.api_url }}" staging

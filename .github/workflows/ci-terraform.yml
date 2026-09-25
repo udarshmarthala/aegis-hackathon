@@ -1,0 +1,220 @@
+# Terraform CI. fmt and validate always run. plan runs only when the read-only
+# plan role is configured, so this workflow is green on a repository that has
+# no AWS account attached yet — which is the state the project is in today.
+#
+# This workflow NEVER applies. Apply lives in deploy-staging.yml and
+# deploy-production.yml, both behind GitHub Environments. A pull request from a
+# fork must never be able to mutate infrastructure.
+name: ci-terraform
+
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/ci-terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/ci-terraform.yml"
+
+concurrency:
+  group: ci-terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # --------------------------------------------------------- fmt + lint ---
+  static:
+    name: fmt + tflint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -recursive -check -diff infra/terraform
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.54.0
+
+      - name: tflint
+        working-directory: infra/terraform
+        run: |
+          tflint --init
+          tflint --recursive --minimum-failure-severity=error
+
+  # ------------------------------------------------------------ validate ---
+  # -backend=false: validation must not need credentials or a state bucket.
+  validate:
+    name: validate (${{ matrix.dir }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - infra/terraform/bootstrap
+          - infra/terraform/environments/staging
+          - infra/terraform/environments/production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (no backend)
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: ${{ matrix.dir }}
+        run: terraform validate -no-color
+
+  # ---------------------------------------------------------------- plan ---
+  plan:
+    name: plan (staging)
+    if: github.event_name == 'pull_request'
+    needs: [static, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write          # OIDC token for AWS role assumption
+      pull-requests: write     # to post the plan comment
+    steps:
+      - uses: actions/checkout@v4
+
+      # A repository without AWS wiring must not fail this job. The gate
+      # publishes an explicit skip rather than silently passing.
+      - name: Check plan role is configured
+        id: gate
+        env:
+          ROLE: ${{ vars.AWS_PLAN_ROLE_ARN }}
+        run: |
+          if [ -z "${ROLE}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Terraform plan skipped::vars.AWS_PLAN_ROLE_ARN is not set; no AWS account is attached to this repository yet."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.gate.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: aegis-tf-plan-${{ github.run_id }}
+          # No long-lived keys exist anywhere in this repository. The role is
+          # assumed with a short-lived OIDC token scoped to this repo.
+          role-duration-seconds: 1800
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.gate.outputs.configured == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        if: steps.gate.outputs.configured == 'true'
+        working-directory: infra/terraform/environments/staging
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      # Resolve the tag staging is actually running, so the plan shows the
+      # infrastructure diff and not a phantom image change. tfvars files are
+      # gitignored by design: every value comes from a committed default, a
+      # repository variable, or this lookup.
+      - name: Resolve deployed image tag
+        if: steps.gate.outputs.configured == 'true'
+        id: image
+        run: |
+          tag="$(bash scripts/ci/current-image-tag.sh \
+            "${{ vars.ECS_CLUSTER_STAGING }}" "${{ vars.ECS_SERVICE_API_STAGING }}")"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "staging is running image tag: ${tag}"
+
+      - name: terraform plan
+        if: steps.gate.outputs.configured == 'true'
+        id: plan
+        working-directory: infra/terraform/environments/staging
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -lock=false \
+            -var="image_tag=${{ steps.image.outputs.tag }}" \
+            -out=tfplan 2>&1 | tee plan.txt
+          # Terraform renders any attribute marked sensitive as
+          # "(sensitive value)". Nothing below prints a resolved secret.
+          {
+            echo "summary<<PLANEOF"
+            tail -c 60000 plan.txt
+            echo "PLANEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The plan text is passed through the environment, never interpolated
+      # into the script body: a resource name in a plan must not be able to
+      # become JavaScript in a privileged workflow.
+      - name: Comment plan on PR
+        if: always() && steps.gate.outputs.configured == 'true'
+        uses: actions/github-script@v7
+        env:
+          PLAN_TEXT: ${{ steps.plan.outputs.summary }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const marker = '<!-- aegis-terraform-plan-staging -->';
+            const plan = (process.env.PLAN_TEXT || '(no plan output captured)')
+              .replace(/```/g, '`​``');
+            const body = [
+              marker,
+              '### Terraform plan — staging',
+              '',
+              'Outcome: `' + process.env.PLAN_OUTCOME + '`',
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Plan only. Nothing is applied from a pull request._',
+            ].join(String.fromCharCode(10));
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = existing.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment(
+                { owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment(
+                { owner, repo, issue_number, body });
+            }

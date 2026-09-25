@@ -1,0 +1,62 @@
+# MEM-HR-002 - Profile service approaches its limit without being killed
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: MEM-HR-002
+title: Profile service approaches its limit without being killed
+category: memory_pressure
+workload: hotelreservation
+severity: P3
+difficulty: hard
+version: 1
+description: "Memory sits at 92% of the limit and garbage collection cost rises. Nothing has failed yet, so the honest outcome is a low-severity finding rather than an incident with a confident cause."
+tags:
+  - no-impact-yet
+  - restraint
+fault:
+  target: profile
+  mode: memory_leak
+  duration_s: 1800
+  parameters:
+    mb_per_minute: 8
+alert:
+  title: "Profile memory above 90% of limit"
+  severity: P3
+  service_hint: profile
+  metric: container_memory_usage_bytes
+  labels:
+    alertname: MemoryHighWatermark
+  annotations:
+    summary: "92% of limit, no restarts, latency normal"
+  fires_after_s: 600
+ground_truth:
+  affected_services:
+    - profile
+  root_cause_service: profile
+  root_cause_category: memory_leak
+  root_cause_statement: "profile's heap grows slowly and has not yet been reclaimed; there is no user-visible impact yet."
+  causal_dependency:
+    - profile
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: profile
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: profile
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: profile
+      required: false
+  expected_blast_radius:
+    - profile
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+    - rollback_deployment
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria:
+    - container_memory_usage_bytes
+  should_abstain: false
+  notes: "No action is the correct action: nothing is failing. Restarting a healthy service to reclaim memory is an unforced outage."

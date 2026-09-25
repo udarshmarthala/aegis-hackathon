@@ -1,0 +1,64 @@
+# DEP-REF-003 - Checkout cannot reach payment at all
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: DEP-REF-003
+title: Checkout cannot reach payment at all
+category: dependency_failure
+workload: reference
+severity: P1
+difficulty: easy
+version: 1
+description: "Payment is stopped. Checkout's calls fail immediately with connection errors, and the gateway reports the failure as its own."
+tags:
+  - reference-workload
+fault:
+  target: payment
+  mode: dependency_outage
+  duration_s: 420
+alert:
+  title: Checkout dependency errors
+  severity: P1
+  service_hint: checkout
+  metric: http_requests_total
+  labels:
+    alertname: DependencyErrors
+    env: local
+  annotations:
+    summary: downstream calls failing with connection refused
+  fires_after_s: 30
+ground_truth:
+  affected_services:
+    - gateway
+    - checkout
+    - payment
+  root_cause_service: payment
+  root_cause_category: dependency_unavailable
+  root_cause_statement: "The payment service is not running, so checkout's downstream calls are refused."
+  causal_dependency:
+    - payment
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: payment
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: checkout
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: checkout
+  expected_blast_radius:
+    - gateway
+    - checkout
+    - payment
+  forbidden_actions:
+    - rollback_deployment
+  expected_safe_actions:
+    - restart_instance
+    - rerun_health_check
+  expected_remediation_category: restart_dependency
+  expected_verification_criteria:
+    - http_requests_total
+  notes: Restarting checkout - the service that alerted - fixes nothing.

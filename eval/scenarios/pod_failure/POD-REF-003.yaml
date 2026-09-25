@@ -1,0 +1,66 @@
+# POD-REF-003 - Checkout container is OOM-killed under normal traffic
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: POD-REF-003
+title: Checkout container is OOM-killed under normal traffic
+category: pod_failure
+workload: reference
+severity: P2
+difficulty: medium
+version: 1
+description: Checkout is killed by the runtime shortly after each start. Latency looks fine between kills, so an averaged view hides the outage entirely.
+tags:
+  - oom
+  - flapping
+fault:
+  target: checkout
+  mode: process_kill
+  duration_s: 720
+  parameters:
+    reason: oom
+    interval_s: 150
+alert:
+  title: Checkout availability dips
+  severity: P2
+  service_hint: checkout
+  metric: up
+  labels:
+    alertname: InstanceFlapping
+    env: local
+  annotations:
+    summary: instance up/down 5 times in 12 minutes
+  fires_after_s: 150
+ground_truth:
+  affected_services:
+    - checkout
+    - gateway
+  root_cause_service: checkout
+  root_cause_category: instance_crash
+  root_cause_statement: The checkout container is being terminated by the runtime for exceeding its memory limit and restarted.
+  causal_dependency:
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: checkout
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: checkout
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: checkout
+  expected_blast_radius:
+    - checkout
+    - gateway
+  forbidden_actions:
+    - rollback_deployment
+  expected_safe_actions:
+    - restart_instance
+    - rerun_health_check
+  expected_remediation_category: raise_memory_limit
+  expected_verification_criteria:
+    - up
+    - container_memory_usage_bytes
+  notes: A restart is not a fix here, only a reset of the clock; the diagnosis must say so.

@@ -1,0 +1,147 @@
+# Harness CI — the benchmark's own tooling.
+#
+# The evaluation harness had no CI at all, which is a strange gap for the code
+# whose output is cited as evidence that the platform works. Four things are
+# checked, and each has failed silently at least once in this repo's history:
+#
+#   1. the generated topology artefacts match their source specs — a compose file
+#      that has drifted from the graph it claims to implement is an environment
+#      nobody can reproduce;
+#   2. eval/ and workload/ pass the same lint rules as backend/ — a benchmark
+#      whose own tooling is unreviewed produces numbers nobody should act on;
+#   3. every scenario in the corpus still loads, validates and reports a truthful
+#      preflight — a scenario file is operator input, and a malformed one should
+#      fail here rather than thirty minutes into a nightly run;
+#   4. the workload image builds and still implements the whole fault vocabulary.
+#
+# What this deliberately does NOT do is run the benchmark. A real run needs
+# Postgres, Prometheus, a live topology and a model key, takes tens of minutes
+# and costs money per scenario. That belongs in a scheduled job with secrets,
+# not on every pull request.
+name: ci-harness
+
+on:
+  pull_request:
+    paths:
+      - "eval/**"
+      - "workload/**"
+      - "infra/docker/**"
+      - "infra/prometheus/**"
+      - ".github/workflows/ci-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "eval/**"
+      - "workload/**"
+      - "infra/docker/**"
+      - "infra/prometheus/**"
+      - ".github/workflows/ci-harness.yml"
+
+concurrency:
+  group: ci-harness-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  harness:
+    name: topology + lint + corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      # The generator writes a compose file and one Prometheus target list per
+      # topology. If any is stale, the environment on disk is not the one the
+      # specs describe and every number produced in it is unattributable.
+      - name: Generated topology artefacts are current
+        run: python eval/topology.py --check
+
+      - name: ruff (harness and workload)
+        run: python -m ruff check eval workload
+
+      # Loads and validates all 52 scenario files, then prints what could be
+      # injected. --dry-run needs no stack, no database and no model.
+      - name: Corpus validates and the preflight is truthful
+        run: python eval/run.py --suite full --dry-run
+
+      # A compose file that does not parse is a broken environment that would
+      # otherwise only be found by someone trying to start it.
+      #
+      # `.env` is created from the example rather than passed with --env-file:
+      # the api and worker services carry `env_file: ../../.env` in the compose
+      # file itself, and --env-file only supplies interpolation variables. With
+      # just the flag, compose resolves the graph and then fails on a missing
+      # file - which is what this step did on its first run.
+      - name: Compose files parse together
+        run: |
+          cp .env.example .env
+          docker compose \
+            -f infra/docker/docker-compose.yml \
+            -f infra/docker/topologies.generated.yml \
+            --env-file .env \
+            --project-name aegis-ci config --quiet
+          rm -f .env
+
+  # The reference workload is what every fault is injected into. If its image
+  # stops building, the whole benchmark stops running — and the failure would
+  # otherwise surface as "could not inject" in a nightly report rather than here.
+  workload-image:
+    name: workload image builds and implements every mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t aegis-workload:ci workload
+
+      - name: The fault vocabulary is complete and unknown modes are refused
+        run: |
+          set -euo pipefail
+          docker run -d --name wl -p 18080:8080 aegis-workload:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:18080/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          modes=$(curl -fsS http://localhost:18080/admin/modes \
+            | python -c 'import json,sys; print(len(json.load(sys.stdin)["modes"]))')
+          echo "workload implements $modes fault modes"
+          # 17 is the size of FaultMode in backend/src/aegis/evaluation/schema.py.
+          # Fewer means some scenario cannot be injected — the condition that
+          # left 60% of the corpus unrunnable before.
+          test "$modes" -eq 17
+
+          # An unknown mode must be refused. Accepting it and injecting nothing
+          # is how a healthy system gets scored against a fault nobody applied.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"mode":"not_a_real_mode"}' http://localhost:18080/admin/fault)
+          echo "unknown mode -> HTTP $code"
+          test "$code" = "400"
+
+      - name: Stop
+        if: always()
+        run: docker rm -f wl || true

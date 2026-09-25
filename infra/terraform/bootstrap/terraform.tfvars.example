@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in. Real *.tfvars files are gitignored.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   terraform init
+#   terraform apply
+
+aws_region = "us-east-1"
+owner      = "platform"
+
+# Must be globally unique across every AWS account. Append your account id.
+state_bucket_name = "aegis-tfstate-000000000000"
+lock_table_name   = "aegis-terraform-locks"
+
+# The repository allowed to assume AWS roles through OIDC. Leave empty to skip
+# the OIDC provider entirely (for example, when deploying only from a laptop).
+github_repository    = "your-org/aegis-2.0"
+create_oidc_provider = true
+
+ecr_repositories = ["aegis/backend", "aegis/web"]

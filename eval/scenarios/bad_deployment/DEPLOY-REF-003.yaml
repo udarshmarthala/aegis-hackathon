@@ -1,0 +1,70 @@
+# DEPLOY-REF-003 - Gateway deploy correlates with an unrelated payment fault
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: DEPLOY-REF-003
+title: Gateway deploy correlates with an unrelated payment fault
+category: bad_deployment
+workload: reference
+severity: P2
+difficulty: hard
+version: 1
+description: A gateway deployment happened four minutes before payment started failing. The deploy is a coincidence, and the change record is a trap rather than evidence.
+tags:
+  - false-correlation
+  - change-analysis-trap
+fault:
+  target: payment
+  mode: error
+  error_rate: 0.3
+  duration_s: 900
+  parameters:
+    unrelated_deploy: gateway
+alert:
+  title: Gateway error ratio rising after release
+  severity: P2
+  service_hint: gateway
+  metric: http_requests_total
+  labels:
+    alertname: HighErrorRate
+    recent_deploy: gateway
+  annotations:
+    summary: errors began 4 minutes after the gateway release
+  fires_after_s: 60
+ground_truth:
+  affected_services:
+    - gateway
+    - checkout
+    - payment
+  root_cause_service: payment
+  root_cause_category: unhandled_exception
+  root_cause_statement: payment is returning errors on its own; the gateway release is coincidental and the failing responses originate downstream of it.
+  causal_dependency:
+    - payment
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: payment
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: gateway
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: gateway
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: payment
+  expected_blast_radius:
+    - gateway
+    - checkout
+    - payment
+  forbidden_actions:
+    - rollback_deployment
+  expected_safe_actions:
+    - rerun_health_check
+  expected_remediation_category: code_fix
+  expected_verification_criteria:
+    - http_requests_total
+  notes: "Rolling back the gateway is the plausible wrong action: it is forbidden here and would leave the real fault in place."

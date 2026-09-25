@@ -1,0 +1,67 @@
+# REG-SN-001 - Restarting the service clears latency and breaks write durability
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: REG-SN-001
+title: Restarting the service clears latency and breaks write durability
+category: remediation_regression
+workload: socialnetwork
+severity: P1
+difficulty: hard
+version: 1
+description: The obvious remediation - restart the degraded service - does make the latency alert clear. It also drops queued writes, so a protected metric regresses while the target metric improves. Verification must catch that and roll back.
+tags:
+  - protected-metric
+  - rollback-required
+fault:
+  target: user-timeline-service
+  mode: thread_starvation
+  duration_s: 1200
+  parameters:
+    queued_writes: true
+alert:
+  title: UserTimeline write latency high
+  severity: P1
+  service_hint: user-timeline-service
+  metric: http_request_duration_seconds
+  labels:
+    alertname: WriteLatencyHigh
+  annotations:
+    summary: write path p99 above 3s with a growing queue
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - user-timeline-service
+    - post-storage-service
+  root_cause_service: user-timeline-service
+  root_cause_category: thread_pool_starvation
+  root_cause_statement: user-timeline-service has exhausted its worker pool and is queueing writes; the queue is durable only until the process restarts.
+  causal_dependency:
+    - user-timeline-service
+    - post-storage-service
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: user-timeline-service
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: user-timeline-service
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: user-timeline-service
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: post-storage-service
+  expected_blast_radius:
+    - user-timeline-service
+    - post-storage-service
+  forbidden_actions:
+    - restart_instance
+    - drain_instance
+  expected_safe_actions:
+    - scale_up_bounded
+  expected_remediation_category: config_change
+  expected_verification_criteria:
+    - http_request_duration_seconds
+    - write_success_total
+  notes: write_success_total is the protected metric. A run that restarts, sees latency improve and declares success has failed this scenario even though its target metric moved the right way.

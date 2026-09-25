@@ -1,0 +1,161 @@
+# Build, scan and publish container images to Amazon ECR.
+#
+# Order matters: images are built and loaded locally, scanned, and only then
+# pushed. A vulnerable image never reaches the registry, so "it is in ECR"
+# always means "it passed the scan".
+#
+# Authentication is GitHub OIDC only. There is no AWS access key in this
+# repository, in these workflows, or in any secret they read.
+name: docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push to ECR (uncheck for a build-and-scan dry run)"
+        type: boolean
+        default: true
+
+# Images are immutable per commit SHA, so two runs never collide. main is not
+# cancelled: a superseded build still produces a digest staging may reference.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.component }} image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            context: backend
+            dockerfile: backend/Dockerfile
+            repo_var: ECR_REPOSITORY_BACKEND
+          - component: web
+            context: frontend
+            dockerfile: frontend/Dockerfile
+            repo_var: ECR_REPOSITORY_WEB
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # semver-ish: the product version from pyproject.toml, the monotonic run
+      # number so two builds of the same version are orderable, and the short
+      # SHA so a running task can be traced back to a commit with no lookup.
+      - name: Compute version
+        id: version
+        run: |
+          base="$(grep -m1 '^version = ' backend/pyproject.toml | cut -d'"' -f2)"
+          short="$(git rev-parse --short=12 HEAD)"
+          echo "version=${base}-${GITHUB_RUN_NUMBER}-g${short}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: aegis-ecr-push-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Login to Amazon ECR
+        id: ecr
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Fargate on x86 by default. ARM64 Fargate is ~20% cheaper per vCPU-hour
+      # (docs/cost-strategy.md); switching means building on arm64 runners AND
+      # flipping cpu_architecture in the compute module. Both or neither.
+      - name: Build (load locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: aegis-${{ matrix.component }}:scan
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_AEGIS_ENV=${{ vars.NEXT_PUBLIC_AEGIS_ENV }}
+            NEXT_PUBLIC_FIREBASE_API_KEY=${{ vars.NEXT_PUBLIC_FIREBASE_API_KEY }}
+            NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${{ vars.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN }}
+            NEXT_PUBLIC_FIREBASE_PROJECT_ID=${{ vars.NEXT_PUBLIC_FIREBASE_PROJECT_ID }}
+            NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=${{ vars.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET }}
+            NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=${{ vars.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID }}
+            NEXT_PUBLIC_FIREBASE_APP_ID=${{ vars.NEXT_PUBLIC_FIREBASE_APP_ID }}
+
+      # ignore-unfixed: a distro CVE with no released patch cannot be actioned
+      # by this pipeline. Everything with a fix available is a hard failure.
+      # Installed from trivy's apt repo; the action's own installer
+      # resolves release assets at run time and failed to start here.
+      # Trivy is installed from its own apt repository. The trivy-action
+      # installer resolves release assets through the GitHub API at run time
+      # and failed to start at all here, which is worse than no gate: the red
+      # build looks like a finding and a green retry looks like a pass.
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key |
+            gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" |
+            sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq trivy
+          trivy --version
+
+      # The image is scanned from the local daemon before it is ever pushed,
+      # so a vulnerable build never reaches the registry.
+      - name: Scan image
+        env:
+          IMAGE_REF: aegis-${{ matrix.component }}:scan
+        run: |
+          trivy --quiet image "$IMAGE_REF" --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed
+
+      - name: Tag and push to ECR
+        if: vars.AWS_DEPLOY_ROLE_ARN != '' && (github.event_name == 'push' || inputs.push)
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars[matrix.repo_var] }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for tag in "${GITHUB_SHA}" "${VERSION}"; do
+            docker tag "aegis-${{ matrix.component }}:scan" "${REGISTRY}/${REPOSITORY}:${tag}"
+            docker push "${REGISTRY}/${REPOSITORY}:${tag}"
+          done
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "${REGISTRY}/${REPOSITORY}:${GITHUB_SHA}" || true)"
+          echo "pushed ${REPOSITORY}:${GITHUB_SHA} and :${VERSION}"
+          echo "digest=${digest}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report skip
+        if: vars.AWS_DEPLOY_ROLE_ARN == ''
+        run: |
+          echo "::warning title=ECR push skipped::vars.AWS_DEPLOY_ROLE_ARN is unset; the image was built and scanned but not published."

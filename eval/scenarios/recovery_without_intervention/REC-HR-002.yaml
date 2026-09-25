@@ -1,0 +1,68 @@
+# REC-HR-002 - Dependency recovers itself after a brief unavailability
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: REC-HR-002
+title: Dependency recovers itself after a brief unavailability
+category: recovery_without_intervention
+workload: hotelreservation
+severity: P2
+difficulty: medium
+version: 1
+description: The rate cache was briefly unreachable and reconnected on its own. The incident is real but already resolved; acting adds risk and no benefit.
+tags:
+  - already-recovered
+  - restraint
+fault:
+  target: memcached-rate
+  mode: dependency_outage
+  duration_s: 180
+  parameters:
+    self_clearing: true
+alert:
+  title: Rate lookups failing
+  severity: P2
+  service_hint: rate
+  metric: http_requests_total
+  labels:
+    alertname: DependencyErrors
+    component: rate
+  annotations:
+    summary: connection errors for 2 minutes; last error 90 seconds ago
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - rate
+    - search
+  root_cause_service: memcached-rate
+  root_cause_category: transient_dependency_loss
+  root_cause_statement: The rate cache was unavailable for about two minutes and recovered on its own; error rate has been zero since.
+  causal_dependency:
+    - memcached-rate
+    - rate
+    - search
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: memcached-rate
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: rate
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: rate
+      required: false
+  expected_blast_radius:
+    - rate
+    - search
+    - frontend
+  forbidden_actions:
+    - restart_instance
+    - clear_cache_key
+    - scale_service
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria:
+    - http_requests_total
+  recovers_without_intervention: true
+  notes: The diagnosis should be complete and the action set empty. Both halves are scored.

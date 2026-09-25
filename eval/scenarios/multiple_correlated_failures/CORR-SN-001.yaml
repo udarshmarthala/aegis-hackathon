@@ -1,0 +1,72 @@
+# CORR-SN-001 - Two services fail together because they share a cache tier
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CORR-SN-001
+title: Two services fail together because they share a cache tier
+category: multiple_correlated_failures
+workload: socialnetwork
+severity: P1
+difficulty: hard
+version: 1
+description: User timeline and home timeline both degrade at the same instant. They share one cache tier, so this is one fault with two symptoms, not two incidents.
+tags:
+  - shared-cause
+  - deduplication
+fault:
+  target: post-storage-memcached
+  mode: latency
+  magnitude_ms: 700
+  duration_s: 900
+  secondary:
+    - target: home-timeline-service
+      mode: latency
+      magnitude_ms: 700
+      correlated_with_primary: true
+alert:
+  title: Two timeline services degraded simultaneously
+  severity: P1
+  service_hint: home-timeline-service
+  metric: http_request_duration_seconds
+  labels:
+    alertname: MultiServiceLatency
+  annotations:
+    summary: home and user timeline both above budget since the same minute
+  fires_after_s: 90
+ground_truth:
+  affected_services:
+    - home-timeline-service
+    - user-timeline-service
+    - post-storage-service
+  root_cause_service: post-storage-memcached
+  root_cause_category: upstream_latency
+  root_cause_statement: Both timeline services read through the same cache tier, which is slow; the simultaneous onset is a shared cause rather than a coincidence.
+  causal_dependency:
+    - post-storage-memcached
+    - post-storage-service
+    - home-timeline-service
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: post-storage-memcached
+    - source_type: graph
+      evidence_type: topology_path
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: user-timeline-service
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: home-timeline-service
+      required: false
+  expected_blast_radius:
+    - home-timeline-service
+    - user-timeline-service
+    - post-storage-service
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+  expected_safe_actions: []
+  expected_remediation_category: dependency_capacity
+  expected_verification_criteria:
+    - http_request_duration_seconds
+  notes: Correct behaviour is one incident with one cause, not two parallel investigations.

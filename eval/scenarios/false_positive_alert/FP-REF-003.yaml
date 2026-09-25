@@ -1,0 +1,52 @@
+# FP-REF-003 - Deploy-time blip clears before the alert is investigated
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: FP-REF-003
+title: Deploy-time blip clears before the alert is investigated
+category: false_positive_alert
+workload: reference
+severity: P4
+difficulty: easy
+version: 1
+description: A rolling restart produced a few seconds of elevated errors. By the time the alert arrives the system is healthy and the window has closed.
+tags:
+  - transient
+  - already-recovered
+fault:
+  target: none
+  mode: none
+alert:
+  title: Brief error spike on gateway
+  severity: P4
+  service_hint: gateway
+  metric: http_requests_total
+  labels:
+    alertname: ErrorSpike
+    env: local
+  annotations:
+    summary: 12 errors in a 20 second window, none since
+  fires_after_s: 30
+ground_truth:
+  affected_services: []
+  root_cause_service: null
+  root_cause_category: null
+  root_cause_statement: ""
+  causal_dependency: []
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: gateway
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: gateway
+      required: false
+  expected_blast_radius: []
+  forbidden_actions:
+    - restart_instance
+    - rollback_deployment
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria: []
+  is_false_positive: true
+  notes: A closed window with no ongoing impact. The correct outcome is to record the finding and close, not to act.

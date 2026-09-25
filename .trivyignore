@@ -1,0 +1,131 @@
+# Trivy accepted findings.
+#
+# Read this before adding a line. Every entry here is a security finding that
+# this project has decided NOT to fix, which means every entry is a small
+# permanent hole in the gate. The rules:
+#
+#   * One finding ID per entry, never a blanket suppression and never a
+#     severity threshold change. If you cannot name the specific thing you are
+#     accepting, you are not accepting it, you are hiding it.
+#   * A reason that survives someone else reading it in a year - what the
+#     finding is, why the "fix" is worse than the finding here, and what would
+#     have to change for the entry to go away.
+#   * An expiry date. Trivy re-raises the finding after it, which forces the
+#     decision to be made again rather than inherited.
+#
+# Known limitation of this file format: trivy's plain .trivyignore matches on
+# ID only, with no path scoping (the path-scoped .trivyignore.yaml form is not
+# auto-loaded, and the CI gate passes no --ignorefile). So an ID accepted here
+# for one resource is also accepted for any FUTURE resource that trips the same
+# rule. Where that matters it is called out in the entry below. Keep this list
+# short for exactly that reason.
+
+# --------------------------------------------------------------------------
+# AWS-0053 (HIGH) - "Load balancer is exposed publicly."
+#   infra/terraform/modules/compute/main.tf, aws_lb.this, internal = false
+#
+# Intentional, and the product does not exist without it. This ALB IS the
+# public entrypoint: the Vercel-hosted frontend calls it from the internet,
+# operators reach the incident UI through it, and external alert sources POST
+# to /alerts/ingest. Making it internal would mean the API is reachable only
+# from inside the VPC, which is not a hardened Aegis - it is no Aegis at all.
+#
+# What actually guards this boundary, none of which trivy can see:
+#   * ALB security group ingress is limited to allowed_ingress_cidrs.
+#   * Authentication is Firebase ID tokens, verified per request, fail-closed
+#     when Firebase is unconfigured.
+#   * /alerts/ingest requires the ALERT_INGEST_TOKEN secret.
+#   * drop_invalid_header_fields and desync_mitigation_mode = defensive.
+#   * Transport is TLS whenever a certificate is configured, and the plaintext
+#     listener now requires an explicit allow_insecure_http opt-in that
+#     production hardcodes to false (see AWS-0054, fixed rather than ignored).
+#
+# Removing this entry requires the API to stop being internet-facing, e.g.
+# fronting it with CloudFront or a private link from the frontend's host. Not
+# planned. Re-confirm annually that it is still the intended architecture.
+AWS-0053 exp:2027-09-30
+
+# --------------------------------------------------------------------------
+# AWS-0104 (CRITICAL) - "Security group rule allows unrestricted egress."
+#   infra/terraform/modules/network/main.tf, aws_vpc_security_group_egress_rule.tasks_all
+#
+# Accepted because the alternative is an allowlist that breaks the product
+# silently. Investigation tasks must reach Google AI Studio, LangSmith, GitHub
+# and Slack. None of those publish a stable IP range, so a CIDR allowlist here would be wrong within
+# weeks, and it would fail as a dropped packet - a timeout mid-investigation,
+# not a clear error. An SRE platform that stops mid-incident because a provider
+# changed an IP is worse than one with open egress.
+#
+# The real control is at the application layer: outbound HTTP goes through
+# configured base URLs only, every call has an explicit timeout, a bounded
+# retry and a circuit breaker, and the egress path carries no credentials
+# beyond the provider key it is calling with.
+#
+# This is CRITICAL-severity by trivy's rating, not by ours; the rating assumes
+# a data-exfiltration path out of a network that had one to protect. Removing
+# this entry requires routing all third-party traffic through an egress proxy
+# with a domain allowlist, which is the right long-term answer and is not
+# built. Six-month expiry so that stays a live question, not a settled one.
+AWS-0104 exp:2027-03-31
+
+# --------------------------------------------------------------------------
+# AWS-0132 (HIGH) - "Bucket does not encrypt data with a customer managed key."
+#   infra/terraform/bootstrap/main.tf, aws_s3_bucket_server_side_encryption_configuration.state
+#   infra/terraform/modules/datastores/main.tf, ...server_side_encryption_configuration.alb_logs
+#
+# PARTIALLY FIXED, not wholly accepted. The artifacts bucket - the one holding
+# archived evidence and execution outputs, the data that makes a past incident
+# auditable - was moved to SSE-KMS under the environment's customer-managed key
+# in this same change, with matching kms:Decrypt / kms:GenerateDataKey grants
+# scoped via s3 on the API and worker task roles. That was the finding worth
+# fixing, and it is fixed.
+#
+# Two buckets remain on SSE-S3 (AES256), both deliberately:
+#
+#   1. The Terraform state bucket (bootstrap). Bootstrap runs with LOCAL state
+#      into an empty account, before any KMS key exists - the key it would use
+#      is created by the environment roots that this bucket's existence is a
+#      prerequisite for. Breaking that cycle means creating a key in bootstrap
+#      and granting every principal that runs Terraform (both GitHub OIDC roles
+#      and any operator) use of it. Get that key policy wrong and the state
+#      file is unreadable by the only tool that can repair it. The bucket is
+#      already private, versioned, TLS-only and block-public-access.
+#
+#   2. The ALB access log bucket. AWS log delivery writes here, and pointing it
+#      at a CMK requires a key policy granting the ELB log delivery service
+#      principal - which cannot be validated without a real AWS account, and
+#      whose failure mode is access logs that silently stop being written.
+#      Trivy's own rule text notes SSE-KMS is unsupported for log destination
+#      buckets. The contents are request metadata, not evidence.
+#
+# NOTE the format limitation above: with no path scoping, this entry also
+# covers any NEW bucket that lands on SSE-S3. When adding an S3 bucket, check
+# its encryption by hand - this gate will not do it for you.
+#
+# Removing this entry requires the KMS key-policy work for log delivery and a
+# decision on bootstrap key custody. Six months.
+AWS-0132 exp:2027-03-31
+
+# --------------------------------------------------------------------------
+# AWS-0136 (HIGH) - "SNS topic not encrypted with a customer managed key."
+#   infra/terraform/modules/observability/main.tf, aws_sns_topic.alarms
+#
+# The topic IS encrypted at rest, with the AWS-managed key alias/aws/sns.
+# Trivy wants a customer-managed key specifically.
+#
+# Declined because the cost is paid in alert delivery. CloudWatch alarms and
+# AWS Budgets publish to this topic through service principals; under a CMK
+# each needs kms:GenerateDataKey* and kms:Decrypt in the key policy, and a
+# missing grant does not fail loudly - the publish is rejected and the alarm
+# simply never arrives. Trading "alarm names are encrypted with our key rather
+# than Amazon's" for "alarms might stop being delivered" is a bad trade in any
+# system, and a self-defeating one in a platform whose job is noticing that
+# something broke.
+#
+# The payload is alarm names, metric names and thresholds. No incident content,
+# no evidence, no credentials. There is nothing here worth the key-policy risk.
+#
+# Removing this entry requires a reviewed key policy covering every publishing
+# service principal, verified against a real account with a test alarm that is
+# observed to arrive. Revisit with the AWS-0132 key-policy work.
+AWS-0136 exp:2027-03-31

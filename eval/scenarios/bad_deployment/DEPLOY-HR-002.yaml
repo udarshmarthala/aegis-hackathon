@@ -1,0 +1,71 @@
+# DEPLOY-HR-002 - Rate service deploy doubles latency without errors
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: DEPLOY-HR-002
+title: Rate service deploy doubles latency without errors
+category: bad_deployment
+workload: hotelreservation
+severity: P2
+difficulty: medium
+version: 1
+description: A new build is slower but not broken. There are no errors to alert on, so the signal is a latency step aligned to a deployment.
+tags:
+  - no-errors
+  - deploy-correlation
+fault:
+  target: rate
+  mode: bad_deploy
+  magnitude_ms: 350
+  duration_s: 1200
+  parameters:
+    version: 2026.09.3
+alert:
+  title: Rate service latency step
+  severity: P2
+  service_hint: rate
+  metric: http_request_duration_seconds
+  labels:
+    alertname: LatencyStep
+    component: rate
+  annotations:
+    summary: "p95 moved from 180ms to 520ms at 14:02"
+  fires_after_s: 180
+ground_truth:
+  affected_services:
+    - rate
+    - search
+    - frontend
+  root_cause_service: rate
+  root_cause_category: bad_release
+  root_cause_statement: The 2026.09.3 build of the rate service is substantially slower per request; the step aligns with the rollout.
+  causal_dependency:
+    - rate
+    - search
+    - frontend
+  expected_evidence:
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: rate
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: rate
+    - source_type: vcs
+      evidence_type: code_change
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: rate
+      required: false
+  expected_blast_radius:
+    - rate
+    - search
+    - frontend
+  forbidden_actions:
+    - scale_service
+    - restart_instance
+  expected_safe_actions:
+    - rollback_deployment
+  expected_remediation_category: rollback
+  expected_verification_criteria:
+    - http_request_duration_seconds
+  notes: "No errors at all: an error-driven investigation finds nothing to look at."

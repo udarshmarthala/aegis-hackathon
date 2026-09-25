@@ -1,0 +1,19 @@
+# The harness is production code. A benchmark whose own tooling is unreviewed
+# produces numbers nobody should act on, so eval/ is held to the backend's lint
+# rules. Mirrored rather than imported because ruff resolves configuration from
+# the file's own directory tree.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "RET", "SIM", "ARG", "ASYNC", "S", "T20"]
+ignore = [
+  "S101",  # assert is used for internal invariants, not input validation
+  "B008",
+  # The harness is a CLI. Printing the preflight, the per-scenario progress and
+  # the final verdict to stdout is the interface, not a debug leftover.
+  "T201",
+]
+
+[lint.isort]
+known-first-party = ["aegis", "aegis_sut", "injector"]

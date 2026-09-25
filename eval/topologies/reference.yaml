@@ -1,0 +1,25 @@
+# The reference chain. Three services, one hop each, no datastores.
+#
+# These three are also declared directly in docker-compose.yml under the
+# `workload` profile, which is what `make up` starts for ordinary local work.
+# This file is the benchmark's description of the same graph: it is what gives
+# the harness an endpoint map and a topology name to select, and it is why all
+# three topologies are described in one format instead of one being config and
+# two being generated. A benchmark whose environments are defined two ways
+# acquires a third within a month.
+#
+# The generator emits these under the `reference` profile with published ports,
+# so a benchmark run can reach `checkout` and `payment` directly - the compose
+# block cannot, because only `gateway` publishes.
+name: reference
+entrypoint: gateway
+services:
+  gateway:
+    kind: service
+    calls: [checkout]
+  checkout:
+    kind: service
+    calls: [payment]
+  payment:
+    kind: service
+    calls: []

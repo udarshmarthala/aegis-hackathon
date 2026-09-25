@@ -1,0 +1,54 @@
+# hotelReservation - the DeathStarBench topology 19 scenarios are written against.
+#
+# This is not DeathStarBench's source. It is DeathStarBench's *shape*: the
+# service names, the call graph, and the kind of each node. That is all the
+# benchmark ever inspects - a scenario's answer key names services, a causal
+# dependency and a blast radius, never a line of hotel-booking logic. Standing
+# up the real thing would add twenty containers of business logic no evaluator
+# reads, and would still have to be faulted through an injector it does not
+# expose.
+#
+# Every node runs the same instrumented image as the reference workload, so the
+# full 17-mode fault vocabulary applies here exactly as it does there.
+#
+# Edges are derived from the corpus: a scenario's `causal_dependency` runs
+# root-cause first, so the call edge is that chain reversed.
+name: hotelreservation
+entrypoint: frontend
+services:
+  frontend:
+    kind: service
+    calls: [profile, rate, recommendation, reservation, search]
+  search:
+    kind: service
+    calls: [consul, geo, mongodb-reservation, rate]
+  rate:
+    kind: service
+    calls: [memcached-rate]
+  profile:
+    kind: service
+    calls: [mongodb-profile]
+  reservation:
+    kind: service
+    calls: [mongodb-reservation]
+  recommendation:
+    kind: service
+    calls: []
+  geo:
+    kind: service
+    calls: []
+  # Service discovery. A proxy kind: large pool, negligible floor, no cache -
+  # so a scenario that saturates it saturates something that should never be
+  # the bottleneck, which is what makes those scenarios interesting.
+  consul:
+    kind: proxy
+    calls: []
+  memcached-rate:
+    kind: cache
+    calls: []
+  mongodb-profile:
+    kind: datastore
+    calls: []
+  mongodb-reservation:
+    kind: datastore
+    calls: []

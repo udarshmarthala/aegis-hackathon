@@ -1,0 +1,91 @@
+# Copy to a real tfvars file and fill in, or pass these with -var on the CLI.
+# Real *.tfvars files are gitignored; only this example is committed.
+#
+#   cp staging.tfvars.example staging.tfvars
+#   terraform init -backend-config=... && terraform apply -var-file=staging.tfvars
+#
+# CI does NOT use a tfvars file: the workflow passes -var="image_tag=<sha>" and
+# everything else comes from the defaults in variables.tf. If you change a
+# value here that CI must also use, change its default in variables.tf.
+
+aws_region = "us-east-1"
+owner      = "platform"
+
+# From the bootstrap output `ecr_repository_urls["aegis/backend"]`.
+backend_image = "000000000000.dkr.ecr.us-east-1.amazonaws.com/aegis/backend"
+
+# ---- network ---------------------------------------------------------------
+# "single" keeps tasks off the public internet for ~$33/month.
+# "none_public" removes that cost and puts task ENIs in public subnets behind
+# security groups only. Read docs/cost-strategy.md before choosing it.
+nat_strategy               = "single"
+enable_interface_endpoints = false
+vpc_cidr                   = "10.40.0.0/20"
+
+# Narrow this. "0.0.0.0/0" is the default only because a Vercel-hosted frontend
+# has no stable egress range.
+allowed_ingress_cidrs = ["0.0.0.0/0"]
+
+# Request an ACM certificate for your domain and put its ARN here. Leaving it
+# empty serves the API over plain HTTP.
+certificate_arn = ""
+
+# ---- data ------------------------------------------------------------------
+db_instance_class        = "db.t4g.micro"
+db_allocated_storage     = 20
+db_backup_retention_days = 7
+
+# Redis is only required above one API task; see the variable's validation.
+enable_redis = false
+
+# ---- graph -----------------------------------------------------------------
+# "ecs_fargate" self-hosts Neo4j on one task with EFS (~$32/month).
+# "external" provisions nothing; set neo4j_external_uri to an AuraDB endpoint.
+# "disabled" runs Aegis without topology; it records an evidence gap.
+graph_deployment_mode = "ecs_fargate"
+neo4j_external_uri    = ""
+
+# ---- compute ---------------------------------------------------------------
+api_desired_count = 1
+api_cpu           = 512
+api_memory        = 1024
+
+# Zero workers when nothing is queued. Set worker_scaling_mode = "cpu" and
+# worker_min_count = 1 until the backend publishes jobs to SQS.
+worker_min_count    = 0
+worker_max_count    = 4
+worker_scaling_mode = "sqs_backlog"
+worker_use_spot     = true
+cpu_architecture    = "X86_64"
+
+# ---- observability ---------------------------------------------------------
+log_retention_days = 30
+alarm_emails       = ["platform-alerts@example.com"]
+budget_limit_usd   = 250
+
+# ---- application -----------------------------------------------------------
+cors_allowed_origins = "https://aegis-staging.vercel.app"
+api_public_url       = "https://api-staging.example.com"
+google_api_key_count = 4
+
+enable_firebase     = true
+firebase_project_id = "aegis-staging"
+
+# Only the integrations listed here get a secret container and an injected
+# value. Anything omitted is genuinely absent, and Aegis reports it as "not
+# configured" rather than as a source that returned nothing.
+optional_secrets = ["GITHUB_TOKEN", "SLACK_BOT_TOKEN", "LANGSMITH_API_KEY"]
+
+# ---- github oidc -----------------------------------------------------------
+# All four come from the bootstrap outputs.
+github_repository   = "your-org/aegis-2.0"
+oidc_provider_arn   = "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
+tf_state_bucket_arn = "arn:aws:s3:::aegis-tfstate-000000000000"
+tf_lock_table_arn   = "arn:aws:dynamodb:us-east-1:000000000000:table/aegis-terraform-locks"
+
+# ---- the environment Aegis observes ---------------------------------------
+# Read-only unless allow_remediation_actions is also true. Both this and the
+# application's AUTONOMY_ENABLED must be on before Aegis can change anything,
+# and they are owned by different people in different systems on purpose.
+observed_cluster_arns     = []
+allow_remediation_actions = false

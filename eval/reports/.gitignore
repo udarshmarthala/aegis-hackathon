@@ -1,0 +1,4 @@
+# Benchmark output is regenerable; the database is the system of record.
+*.json
+*.md
+!.gitignore

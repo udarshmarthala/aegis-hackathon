@@ -1,0 +1,53 @@
+# Code owners for Aegis 2.0.
+#
+# Ownership follows the safety boundaries in CLAUDE.md sections 3 and 6, not
+# the directory tree for its own sake. The paths where a mistake is a security
+# or data-integrity incident carry an explicit owner; everything else falls
+# through to the default.
+#
+# Replace the placeholder teams with real GitHub teams before enabling
+# "Require review from Code Owners" in branch protection. An unresolvable team
+# silently blocks every PR.
+
+# ------------------------------------------------------------- default ----
+*                                   @aegis/maintainers
+
+# ------------------------------------------------- safety-critical core ----
+# The deterministic half of "the LLM proposes, deterministic code decides".
+/backend/src/aegis/policy/          @aegis/maintainers @aegis/security
+/backend/src/aegis/execution/       @aegis/maintainers @aegis/security
+/backend/src/aegis/verification/    @aegis/maintainers @aegis/security
+/backend/src/aegis/evidence/        @aegis/maintainers
+/backend/src/aegis/domain/          @aegis/maintainers
+
+# Authentication, ingestion tokens and the untrusted-text boundary.
+/backend/src/aegis/api/security.py  @aegis/security
+/backend/src/aegis/api/routers/alerts.py        @aegis/security
+/backend/src/aegis/api/routers/policy_admin.py  @aegis/security
+/backend/src/aegis/integrations/    @aegis/maintainers
+
+# ---------------------------------------------------- schema and state ----
+/backend/migrations/                @aegis/maintainers @aegis/data
+
+# ------------------------------------------- pipeline and infrastructure ---
+# A change here can move production. It is reviewed by the people who carry
+# the pager for it.
+/.github/workflows/                 @aegis/platform @aegis/security
+/.github/dependabot.yml             @aegis/platform
+/.github/CODEOWNERS                 @aegis/maintainers
+/infra/                             @aegis/platform
+/infra/terraform/modules/iam/       @aegis/platform @aegis/security
+/infra/terraform/bootstrap/         @aegis/platform @aegis/security
+/scripts/ci/                        @aegis/platform
+
+# ------------------------------------------------------------ frontend ----
+/frontend/                          @aegis/frontend
+
+# ---------------------------------------------- specifications and docs ----
+# The specs outrank the code. Changing them is a product decision.
+/PRD.md                             @aegis/maintainers
+/ESD.md                             @aegis/maintainers
+/AIArchitecture.md                  @aegis/maintainers
+/Aegis_UIUX_Spec.md                 @aegis/maintainers @aegis/frontend
+/CLAUDE.md                          @aegis/maintainers
+/docs/security.md                   @aegis/security

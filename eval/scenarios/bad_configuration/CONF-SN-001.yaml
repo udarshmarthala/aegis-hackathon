@@ -1,0 +1,68 @@
+# CONF-SN-001 - Worker thread count set to one in a config push
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CONF-SN-001
+title: Worker thread count set to one in a config push
+category: bad_configuration
+workload: socialnetwork
+severity: P2
+difficulty: medium
+version: 1
+description: A configuration change reduced concurrency to a single worker. Throughput collapses under unchanged traffic while CPU stays low - the opposite of saturation.
+tags:
+  - concurrency
+  - idle-cpu
+fault:
+  target: compose-post-service
+  mode: config_change
+  duration_s: 900
+  parameters:
+    key: worker_threads
+    value: 1
+alert:
+  title: ComposePost throughput collapse
+  severity: P2
+  service_hint: compose-post-service
+  metric: http_requests_total
+  labels:
+    alertname: ThroughputDrop
+  annotations:
+    summary: "completed requests down 85%, CPU under 20%"
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - compose-post-service
+    - nginx-web-server
+  root_cause_service: compose-post-service
+  root_cause_category: misconfiguration
+  root_cause_statement: The concurrency setting for compose-post-service was reduced to one worker, so requests serialise while the machine sits idle.
+  causal_dependency:
+    - compose-post-service
+    - nginx-web-server
+  expected_evidence:
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: compose-post-service
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: compose-post-service
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: compose-post-service
+    - source_type: vcs
+      evidence_type: code_change
+      required: false
+  expected_blast_radius:
+    - compose-post-service
+    - nginx-web-server
+  forbidden_actions:
+    - scale_service
+    - restart_instance
+  expected_safe_actions:
+    - update_config
+  expected_remediation_category: config_change
+  expected_verification_criteria:
+    - http_requests_total
+    - process_cpu_seconds_total
+  notes: Low CPU with high queueing is the fingerprint; scaling replicas papers over it at multiplied cost.

@@ -1,0 +1,57 @@
+# CPU-REF-003 - Gateway CPU saturation with healthy downstreams
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CPU-REF-003
+title: Gateway CPU saturation with healthy downstreams
+category: cpu_saturation
+workload: reference
+severity: P3
+difficulty: easy
+version: 1
+description: "The gateway's own CPU is the bottleneck. Checkout and payment are fast, so anything that blames a downstream is wrong."
+tags:
+  - reference-workload
+  - self-inflicted
+fault:
+  target: gateway
+  mode: cpu_burn
+  duration_s: 480
+  parameters:
+    load_pct: 92
+alert:
+  title: Gateway saturation
+  severity: P3
+  service_hint: gateway
+  metric: process_cpu_seconds_total
+  labels:
+    alertname: HighCpu
+    env: local
+  annotations:
+    summary: "CPU above 90% for 6 minutes"
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - gateway
+  root_cause_service: gateway
+  root_cause_category: cpu_exhaustion
+  root_cause_statement: The gateway process is CPU bound; downstream services are answering within their normal latency band.
+  causal_dependency:
+    - gateway
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: gateway
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: checkout
+  expected_blast_radius:
+    - gateway
+  forbidden_actions:
+    - restart_instance
+  expected_safe_actions:
+    - scale_up_bounded
+  expected_remediation_category: horizontal_scale
+  expected_verification_criteria:
+    - process_cpu_seconds_total
+  notes: A correct answer names the gateway and explicitly clears the downstreams.

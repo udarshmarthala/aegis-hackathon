@@ -1,0 +1,152 @@
+# Security CI. Every job here is a GATE: a real finding fails the build. None
+# of these steps are "print and continue" — that pattern trains reviewers to
+# ignore the security tab, which is worse than not scanning at all.
+#
+# The weekly schedule matters as much as the PR trigger: a dependency that was
+# clean on Monday can have a CVE on Thursday without anyone touching the repo.
+name: ci-security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ci-security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------- secrets ---
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Full history: a secret committed three commits ago and "removed" in the
+      # tip is still in the pack and still compromised.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Run the container directly rather than gitleaks-action, which requires
+      # a GITLEAKS_LICENSE for organisation-owned repositories.
+      # --redact: findings are reported by rule, file and line, never by value.
+      - name: gitleaks detect
+        run: |
+          docker run --rm -v "${PWD}:/repo" -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source=/repo --redact --verbose --exit-code=1 \
+            --report-format=sarif --report-path=/repo/gitleaks.sarif
+
+      - name: Upload gitleaks SARIF
+        if: always()
+        continue-on-error: true    # needs GitHub Advanced Security on private repos
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ------------------------------------------------- python dependencies ---
+  python-deps:
+    name: pip-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      # Resolve the real dependency graph rather than auditing a hand-written
+      # requirements file that can drift from pyproject.toml.
+      - name: Install project
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip install pip-audit==2.7.3
+
+      # PIP_AUDIT_IGNORE is a repository variable holding space-separated
+      # GHSA/PYSEC ids with an expiry noted in docs/security.md. An empty
+      # variable means nothing is suppressed.
+      - name: pip-audit
+        env:
+          IGNORES: ${{ vars.PIP_AUDIT_IGNORE }}
+        working-directory: backend
+        run: |
+          args=()
+          for id in ${IGNORES}; do args+=(--ignore-vuln "${id}"); done
+          python -m pip_audit --progress-spinner=off --desc "${args[@]}"
+
+  # ---------------------------------------------------- npm dependencies ---
+  npm-deps:
+    name: npm audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # high and critical fail. moderate findings in a transitive build-time
+      # dependency would block every PR for weeks with no security benefit;
+      # they are surfaced in the second (non-gating) report instead.
+      - name: npm audit (gate on high/critical)
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: npm audit (full report, advisory)
+        if: always()
+        continue-on-error: true
+        working-directory: frontend
+        run: npm audit --audit-level=low || true
+
+  # ------------------------------------------- containers + IaC (trivy) ---
+  trivy:
+    name: trivy (dockerfiles, terraform, filesystem)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trivy is installed from its own apt repository rather than through
+      # aquasecurity/trivy-action. The action's installer resolves release
+      # assets through the GitHub API at run time and failed outright here -
+      # exit 1 before scanning anything. A security gate that cannot start is
+      # worse than no gate, because the red build looks like a finding and the
+      # green one after a retry looks like a pass.
+      - name: install trivy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key             | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg]             https://aquasecurity.github.io/trivy-repo/deb generic main"             | sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq trivy
+          trivy --version
+
+      # Misconfiguration scan over Dockerfiles, compose and Terraform.
+      # A non-zero exit makes this a gate, not a report.
+      - name: Trivy config scan
+        run: |
+          trivy --quiet config . --severity HIGH,CRITICAL --exit-code 1 --skip-dirs frontend/node_modules --skip-dirs backend/.venv
+
+      # Vulnerable pinned versions in lockfiles and manifests, plus secrets.
+      # --ignore-unfixed keeps the gate actionable: failing on an advisory with
+      # no released fix trains people to ignore the job.
+      - name: Trivy filesystem scan
+        run: |
+          trivy --quiet fs . --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --skip-dirs frontend/node_modules --skip-dirs backend/.venv

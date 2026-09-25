@@ -1,0 +1,53 @@
+# socialNetwork - the DeathStarBench topology 20 scenarios are written against.
+#
+# See hotelreservation.yaml for why this is the shape rather than the source.
+#
+# One derived edge is deliberately dropped. The corpus implies both
+# `home-timeline-service -> post-storage-service` and the reverse, which is a
+# cycle: two services that call each other would recurse until the request
+# budget ran out, and every scenario would fail for a reason that has nothing to
+# do with the fault. Read direction wins - the timeline reads from storage - and
+# `eval/topology.py` refuses to generate a graph that still contains a cycle, so
+# this cannot be reintroduced silently.
+name: socialnetwork
+entrypoint: nginx-web-server
+services:
+  nginx-web-server:
+    kind: proxy
+    calls: [compose-post-service, user-timeline-service, home-timeline-service]
+  compose-post-service:
+    kind: service
+    calls: [media-service, text-service, user-service, user-mention-service]
+  home-timeline-service:
+    kind: service
+    calls: [post-storage-service, social-graph-service]
+  post-storage-service:
+    kind: service
+    calls: [post-storage-memcached, post-storage-mongodb]
+  social-graph-service:
+    kind: service
+    calls: [social-graph-redis]
+  user-timeline-service:
+    kind: service
+    calls: [post-storage-mongodb]
+  user-mention-service:
+    kind: service
+    calls: []
+  media-service:
+    kind: service
+    calls: []
+  text-service:
+    kind: service
+    calls: []
+  user-service:
+    kind: service
+    calls: []
+  post-storage-memcached:
+    kind: cache
+    calls: []
+  social-graph-redis:
+    kind: cache
+    calls: []
+  post-storage-mongodb:
+    kind: datastore
+    calls: []

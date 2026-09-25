@@ -1,0 +1,15 @@
+[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.set]
+ECC_GATEGUARD = "on"
+GRAPHIFY_GRAPH = "graphify-out/graph.json"
+
+[mcp_servers.graphify]
+command = "graphify-mcp"
+args = [
+    "--graph",
+    "graphify-out/graph.json",
+    "--transport",
+    "stdio",
+]

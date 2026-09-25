@@ -1,0 +1,68 @@
+# AMB-REF-003 - Intermittent errors with a long quiet period between bursts
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: AMB-REF-003
+title: Intermittent errors with a long quiet period between bursts
+category: ambiguous_symptoms
+workload: reference
+severity: P3
+difficulty: hard
+version: 1
+description: Errors appear in short bursts several minutes apart. The pattern is real and localisable, but only if the investigation looks at a window wide enough to contain more than one burst.
+tags:
+  - intermittent
+  - window-selection
+fault:
+  target: payment
+  mode: error
+  error_rate: 0.4
+  probability: 0.25
+  duration_s: 1800
+alert:
+  title: Intermittent gateway errors
+  severity: P3
+  service_hint: gateway
+  metric: http_requests_total
+  labels:
+    alertname: IntermittentErrors
+    env: local
+  annotations:
+    summary: three short error bursts in the last 30 minutes
+  fires_after_s: 300
+ground_truth:
+  affected_services:
+    - gateway
+    - checkout
+    - payment
+  root_cause_service: payment
+  root_cause_category: intermittent_fault
+  root_cause_statement: payment fails in short bursts affecting roughly a quarter of windows; the bursts are visible only over a window that spans several of them.
+  causal_dependency:
+    - payment
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: payment
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: payment
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: gateway
+  expected_blast_radius:
+    - gateway
+    - checkout
+    - payment
+  forbidden_actions:
+    - restart_instance
+    - rollback_deployment
+  expected_safe_actions:
+    - rerun_health_check
+  expected_remediation_category: code_fix
+  expected_verification_criteria:
+    - http_requests_total
+  should_abstain: false
+  notes: Decidable, unlike the other two ambiguous cases - a system that abstains here is over-abstaining, and the benchmark scores that.

@@ -1,0 +1,95 @@
+# Dependency updates.
+#
+# Grouped on purpose: ten separate PRs for ten patch bumps get rubber-stamped,
+# which is how a malicious minor version gets merged. One grouped PR per
+# ecosystem per week is small enough to actually read. Major versions are
+# deliberately excluded from the groups so they arrive alone and get reviewed
+# as the breaking changes they are.
+version: 2
+
+updates:
+  # ------------------------------------------------------------- python ---
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels: [dependencies, backend]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Majors come through as individual PRs, not inside a group.
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # ---------------------------------------------------------------- npm ---
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels: [dependencies, frontend]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      react-and-next:
+        patterns: ["next", "react", "react-dom", "eslint-config-next", "@types/react*"]
+      radix:
+        patterns: ["@radix-ui/*"]
+      npm-minor-patch:
+        patterns: ["*"]
+        exclude-patterns: ["next", "react", "react-dom", "@radix-ui/*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # ------------------------------------------------------------- docker ---
+  # Base images for the two application images plus the local stack. A CVE in
+  # python:3.12-slim is the most likely way a vulnerability reaches production.
+  - package-ecosystem: docker
+    directories:
+      - /backend
+      - /frontend
+      - /workload
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker, security]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker-compose
+    directory: /infra/docker
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, docker, infra]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ----------------------------------------------------- github actions ---
+  # Actions are pinned by tag today. Dependabot keeps them current and is the
+  # mechanism that makes SHA pinning maintainable when it is adopted
+  # (docs/cicd.md, "Action pinning").
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]

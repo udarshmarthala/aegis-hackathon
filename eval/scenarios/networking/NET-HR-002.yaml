@@ -1,0 +1,74 @@
+# NET-HR-002 - Service discovery lookups fail intermittently
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: NET-HR-002
+title: Service discovery lookups fail intermittently
+category: networking
+workload: hotelreservation
+severity: P1
+difficulty: hard
+version: 1
+description: "Name resolution fails for a share of lookups. Every service that re-resolves sees errors, so the failure appears in several unrelated services at once and no single service's own metrics explain it."
+tags:
+  - shared-infrastructure
+  - multi-service
+fault:
+  target: consul
+  mode: dns_failure
+  duration_s: 600
+  parameters:
+    failure_pct: 35
+alert:
+  title: Multiple services reporting connection failures
+  severity: P1
+  service_hint: frontend
+  metric: http_requests_total
+  labels:
+    alertname: WidespreadErrors
+    scope: multi-service
+  annotations:
+    summary: search, rate and profile all returning errors
+  fires_after_s: 60
+ground_truth:
+  affected_services:
+    - frontend
+    - search
+    - rate
+    - profile
+  root_cause_service: consul
+  root_cause_category: dns_resolution_failure
+  root_cause_statement: Service discovery is failing to resolve a third of lookups, so callers cannot reach dependencies that are themselves healthy.
+  causal_dependency:
+    - consul
+    - search
+    - frontend
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: consul
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: search
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: rate
+    - source_type: graph
+      evidence_type: blast_radius
+      required: false
+  expected_blast_radius:
+    - frontend
+    - search
+    - rate
+    - profile
+    - recommendation
+  forbidden_actions:
+    - rollback_deployment
+    - scale_service
+  expected_safe_actions:
+    - restart_instance
+    - rerun_health_check
+  expected_remediation_category: restart_dependency
+  expected_verification_criteria:
+    - http_requests_total
+  notes: The shared symptom across unrelated services is the evidence; picking any single application service is the failure mode.

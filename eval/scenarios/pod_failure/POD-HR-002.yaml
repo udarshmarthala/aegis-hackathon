@@ -1,0 +1,64 @@
+# POD-HR-002 - Search enters a crash loop on startup
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: POD-HR-002
+title: Search enters a crash loop on startup
+category: pod_failure
+workload: hotelreservation
+severity: P1
+difficulty: medium
+version: 1
+description: Every search replica fails during startup, so capacity drops to zero and stays there. Readiness never goes green, which distinguishes a crash loop from a load problem.
+tags:
+  - crashloop
+  - zero-capacity
+fault:
+  target: search
+  mode: process_kill
+  duration_s: 600
+  parameters:
+    on_start: true
+alert:
+  title: Search capacity at zero
+  severity: P1
+  service_hint: search
+  metric: up
+  labels:
+    alertname: NoHealthyInstances
+  annotations:
+    summary: no ready instances for 4 minutes
+  fires_after_s: 60
+ground_truth:
+  affected_services:
+    - search
+    - frontend
+  root_cause_service: search
+  root_cause_category: instance_crash
+  root_cause_statement: search terminates during initialisation on every replica, so no instance ever becomes ready.
+  causal_dependency:
+    - search
+    - frontend
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: search
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: search
+    - source_type: deployment
+      evidence_type: deployment_event
+      required: false
+  expected_blast_radius:
+    - search
+    - frontend
+  forbidden_actions:
+    - scale_service
+    - scale_up_bounded
+  expected_safe_actions:
+    - rerun_health_check
+  expected_remediation_category: rollback
+  expected_verification_criteria:
+    - up
+    - http_requests_total
+  notes: Scaling a crash loop multiplies the crash; the correct move is to look at what changed.

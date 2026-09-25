@@ -1,0 +1,507 @@
+# Deploy to production. Manual dispatch only — there is no automatic path from
+# a merge to production, by design.
+#
+# Protection is enforced by the `aegis-production` GitHub Environment (required
+# reviewers, optional wait timer, branch restriction to main), not by anything
+# in this file. A workflow cannot protect itself; the Environment can.
+#
+# Two modes:
+#   deploy   - plan, gated apply, migrate, roll out, verify.
+#   rollback - point the services back at a previous task definition revision
+#              and re-verify. No Terraform, no migration, no image build.
+#
+# Rollback is a first-class mode rather than a runbook paragraph because the
+# moment you need it is the moment nobody wants to read a runbook.
+name: deploy-production
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "deploy or rollback"
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      image_tag:
+        description: "Image tag to deploy (a commit SHA that docker.yml published)"
+        type: string
+        required: true
+      rollback_api_revision:
+        description: "rollback only: API task definition, e.g. aegis-production-api:41"
+        type: string
+        required: false
+      rollback_worker_revision:
+        description: "rollback only: worker task definition, e.g. aegis-production-worker:39"
+        type: string
+        required: false
+      skip_migrations:
+        description: "Skip the one-off migration task"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_DIR: infra/terraform/environments/production
+
+jobs:
+  # ------------------------------------------------------------ preflight ---
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Require AWS wiring
+        id: check
+        env:
+          ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "${ROLE}" ]; then
+            echo "::error title=Not configured::vars.AWS_DEPLOY_ROLE_ARN is unset. Production deploys require the OIDC deploy role."
+            exit 1
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-preflight-${{ github.run_id }}
+
+      # Production must deploy an artifact that already exists and already
+      # passed the scan gate. Building on the way to production would mean the
+      # thing tested in staging is not the thing shipped.
+      - name: Verify the image exists in ECR
+        if: inputs.mode == 'deploy'
+        run: |
+          set -euo pipefail
+          aws ecr describe-images \
+            --repository-name "${{ vars.ECR_REPOSITORY_BACKEND }}" \
+            --image-ids "imageTag=${{ inputs.image_tag }}" \
+            --query 'imageDetails[0].imagePushedAt' --output text
+          echo "backend image ${{ inputs.image_tag }} is present in ECR"
+
+      - name: Verify rollback inputs
+        if: inputs.mode == 'rollback'
+        run: |
+          if [ -z "${{ inputs.rollback_api_revision }}" ]; then
+            echo "::error title=Missing input::rollback mode requires rollback_api_revision"
+            exit 1
+          fi
+
+  # ----------------------------------------------------------------- plan ---
+  plan:
+    name: terraform plan
+    needs: preflight
+    if: inputs.mode == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      destructive: ${{ steps.inspect.outputs.destructive }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-plan-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -no-color -input=false -out=tfplan \
+            -var="image_tag=${{ inputs.image_tag }}"
+
+      - name: Inspect plan for destructive actions
+        id: inspect
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform show -json tfplan > plan.json
+          destroyed="$(jq -r '
+            [.resource_changes[]
+             | select(.change.actions | index("delete"))
+             | .address] | join(", ")' plan.json)"
+          if [ -n "${destroyed}" ]; then
+            echo "destructive=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Destructive production plan::${destroyed}"
+            {
+              echo "### DESTRUCTIVE changes in the production plan"
+              echo
+              echo '```'
+              echo "${destroyed}" | tr ',' '\n'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "destructive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-tfplan-${{ github.run_id }}
+          path: |
+            ${{ env.TF_DIR }}/tfplan
+            ${{ env.TF_DIR }}/plan.json
+          retention-days: 30
+
+  # ------------------------------------------------- destructive approval ---
+  # A second, narrower Environment. Approving a production deploy is not the
+  # same decision as approving the deletion of a production database.
+  approve-destructive:
+    name: approve destructive production changes
+    needs: plan
+    if: needs.plan.outputs.destructive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1440
+    environment: aegis-production-destructive
+    steps:
+      - run: echo "Destructive production changes approved by ${GITHUB_ACTOR} (run ${GITHUB_RUN_ID})."
+
+  # ---------------------------------------------------------------- apply ---
+  apply:
+    name: terraform apply
+    needs: [preflight, plan, approve-destructive]
+    if: >-
+      always() && inputs.mode == 'deploy' &&
+      needs.plan.result == 'success' &&
+      (needs.approve-destructive.result == 'success' || needs.approve-destructive.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment:
+      name: aegis-production
+      url: ${{ steps.outputs.outputs.api_url }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      cluster: ${{ steps.outputs.outputs.cluster }}
+      api_service: ${{ steps.outputs.outputs.api_service }}
+      worker_service: ${{ steps.outputs.outputs.worker_service }}
+      api_taskdef: ${{ steps.outputs.outputs.api_taskdef }}
+      worker_taskdef: ${{ steps.outputs.outputs.worker_taskdef }}
+      migrate_taskdef: ${{ steps.outputs.outputs.migrate_taskdef }}
+      subnets: ${{ steps.outputs.outputs.subnets }}
+      security_group: ${{ steps.outputs.outputs.security_group }}
+      log_group: ${{ steps.outputs.outputs.log_group }}
+      api_url: ${{ steps.outputs.outputs.api_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-apply-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-tfplan-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}
+
+      - name: terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Read outputs
+        id: outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -euo pipefail
+          terraform output -json > out.json
+          get() { jq -r --arg k "$1" '.[$k].value // empty' out.json; }
+          {
+            echo "cluster=$(get ecs_cluster_name)"
+            echo "api_service=$(get api_service_name)"
+            echo "worker_service=$(get worker_service_name)"
+            echo "api_taskdef=$(get api_task_definition_arn)"
+            echo "worker_taskdef=$(get worker_task_definition_arn)"
+            echo "migrate_taskdef=$(get migrate_task_definition_arn)"
+            echo "subnets=$(jq -r '.task_subnet_ids.value | join(",")' out.json)"
+            echo "security_group=$(get task_security_group_id)"
+            echo "log_group=$(get log_group_name)"
+            echo "api_url=$(get api_base_url)"
+          } >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------- migrate ---
+  migrate:
+    name: run migrations
+    needs: apply
+    if: always() && needs.apply.result == 'success' && !inputs.skip_migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: aegis-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-migrate-${{ github.run_id }}
+
+      - name: Run migration task
+        run: |
+          bash scripts/ci/run-ecs-task.sh \
+            --cluster "${{ needs.apply.outputs.cluster }}" \
+            --task-definition "${{ needs.apply.outputs.migrate_taskdef }}" \
+            --subnets "${{ needs.apply.outputs.subnets }}" \
+            --security-groups "${{ needs.apply.outputs.security_group }}" \
+            --log-group "${{ needs.apply.outputs.log_group }}" \
+            --log-prefix "migrate" \
+            --container "migrate" \
+            --timeout-seconds 1800
+
+  # --------------------------------------------------------------- deploy ---
+  # Serves both modes. In rollback mode Terraform never runs, so the cluster and
+  # service names come from repository variables — rollback must not depend on
+  # Terraform being healthy, because state trouble is one of the reasons to
+  # roll back.
+  deploy:
+    name: roll out (${{ inputs.mode }})
+    needs: [preflight, apply, migrate]
+    if: >-
+      always() && needs.preflight.result == 'success' &&
+      (inputs.mode == 'rollback' ||
+       (needs.apply.result == 'success' &&
+        (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment:
+      name: aegis-production
+      url: ${{ needs.apply.outputs.api_url || vars.API_BASE_URL_PRODUCTION }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      api_url: ${{ steps.target.outputs.api_url }}
+      previous_api_taskdef: ${{ steps.previous.outputs.api }}
+      previous_worker_taskdef: ${{ steps.previous.outputs.worker }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-deploy-${{ github.run_id }}
+
+      - name: Resolve target
+        id: target
+        env:
+          TF_CLUSTER: ${{ needs.apply.outputs.cluster }}
+          TF_API_SERVICE: ${{ needs.apply.outputs.api_service }}
+          TF_WORKER_SERVICE: ${{ needs.apply.outputs.worker_service }}
+          TF_API_TASKDEF: ${{ needs.apply.outputs.api_taskdef }}
+          TF_WORKER_TASKDEF: ${{ needs.apply.outputs.worker_taskdef }}
+          TF_API_URL: ${{ needs.apply.outputs.api_url }}
+        run: |
+          set -euo pipefail
+          cluster="${TF_CLUSTER:-${{ vars.ECS_CLUSTER_PRODUCTION }}}"
+          api_service="${TF_API_SERVICE:-${{ vars.ECS_SERVICE_API_PRODUCTION }}}"
+          worker_service="${TF_WORKER_SERVICE:-${{ vars.ECS_SERVICE_WORKER_PRODUCTION }}}"
+          api_url="${TF_API_URL:-${{ vars.API_BASE_URL_PRODUCTION }}}"
+          if [ "${{ inputs.mode }}" = "rollback" ]; then
+            api_taskdef="${{ inputs.rollback_api_revision }}"
+            worker_taskdef="${{ inputs.rollback_worker_revision }}"
+          else
+            api_taskdef="${TF_API_TASKDEF}"
+            worker_taskdef="${TF_WORKER_TASKDEF}"
+          fi
+          for v in cluster api_service api_url api_taskdef; do
+            if [ -z "$(eval "echo \"\${$v}\"")" ]; then
+              echo "::error title=Missing target::${v} could not be resolved."
+              exit 1
+            fi
+          done
+          {
+            echo "cluster=${cluster}"
+            echo "api_service=${api_service}"
+            echo "worker_service=${worker_service}"
+            echo "api_taskdef=${api_taskdef}"
+            echo "worker_taskdef=${worker_taskdef}"
+            echo "api_url=${api_url}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Captured before anything changes. In deploy mode this is the rollback
+      # target; in rollback mode it is the revision being rolled away from,
+      # which is exactly what a post-incident review needs.
+      - name: Capture current revisions
+        id: previous
+        run: |
+          set -euo pipefail
+          api="$(aws ecs describe-services --cluster "${{ steps.target.outputs.cluster }}" \
+            --services "${{ steps.target.outputs.api_service }}" \
+            --query 'services[0].taskDefinition' --output text)"
+          worker=""
+          if [ -n "${{ steps.target.outputs.worker_service }}" ]; then
+            worker="$(aws ecs describe-services --cluster "${{ steps.target.outputs.cluster }}" \
+              --services "${{ steps.target.outputs.worker_service }}" \
+              --query 'services[0].taskDefinition' --output text)"
+          fi
+          echo "api=${api}" >> "$GITHUB_OUTPUT"
+          echo "worker=${worker}" >> "$GITHUB_OUTPUT"
+          echo "current API revision: ${api}"
+
+      - name: Update API service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.target.outputs.cluster }}" \
+            --service "${{ steps.target.outputs.api_service }}" \
+            --task-definition "${{ steps.target.outputs.api_taskdef }}" \
+            --query 'service.taskDefinition' --output text
+
+      - name: Update worker service
+        if: steps.target.outputs.worker_service != '' && steps.target.outputs.worker_taskdef != ''
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.target.outputs.cluster }}" \
+            --service "${{ steps.target.outputs.worker_service }}" \
+            --task-definition "${{ steps.target.outputs.worker_taskdef }}" \
+            --query 'service.taskDefinition' --output text
+
+      - name: Wait for the API service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.target.outputs.cluster }}" \
+            --services "${{ steps.target.outputs.api_service }}"
+
+  # ------------------------------------------- post-deployment verification ---
+  # Smoke assertions plus a settling window with the CloudWatch alarms checked
+  # afterwards. A deploy that passes a single request and then fails 40% of
+  # traffic for five minutes is a failed deploy, and only the alarms see that.
+  verify:
+    name: post-deployment verification
+    needs: deploy
+    if: always() && needs.deploy.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-prod-verify-${{ github.run_id }}
+
+      - name: Smoke tests
+        run: bash scripts/ci/smoke-test.sh "${{ needs.deploy.outputs.api_url }}" production
+
+      - name: Settle
+        run: sleep 180
+
+      - name: Re-run smoke tests after settling
+        run: bash scripts/ci/smoke-test.sh "${{ needs.deploy.outputs.api_url }}" production
+
+      # Any production alarm in ALARM after a deploy fails the job. The deploy
+      # is not rolled back automatically: an automatic rollback on a noisy
+      # alarm can be worse than the deploy. The rollback command is printed and
+      # a human decides.
+      - name: Check CloudWatch alarms
+        run: |
+          set -euo pipefail
+          alarms="$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "aegis-production" \
+            --state-value ALARM \
+            --query 'MetricAlarms[].AlarmName' --output text)"
+          if [ -n "${alarms}" ] && [ "${alarms}" != "None" ]; then
+            echo "::error title=Alarms firing after deploy::${alarms}"
+            exit 1
+          fi
+          echo "no aegis-production alarms in ALARM"
+
+  # ------------------------------------------------------------- summary ---
+  summary:
+    name: record outcome and rollback path
+    needs: [deploy, verify]
+    if: always() && needs.deploy.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Write summary
+        env:
+          PREV_API: ${{ needs.deploy.outputs.previous_api_taskdef }}
+          PREV_WORKER: ${{ needs.deploy.outputs.previous_worker_taskdef }}
+          VERIFY: ${{ needs.verify.result }}
+        run: |
+          {
+            echo "## Production ${{ inputs.mode }} — ${VERIFY}"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| mode | ${{ inputs.mode }} |"
+            echo "| image tag | ${{ inputs.image_tag }} |"
+            echo "| actor | ${GITHUB_ACTOR} |"
+            echo "| verification | ${VERIFY} |"
+            echo
+            echo "### Rollback"
+            echo
+            echo "Revisions running before this run:"
+            echo
+            echo "    API:    ${PREV_API:-unknown}"
+            echo "    worker: ${PREV_WORKER:-unknown}"
+            echo
+            echo "Re-run this workflow with mode=rollback and those revisions,"
+            echo "or run directly:"
+            echo
+            echo "    aws ecs update-service --cluster ${{ vars.ECS_CLUSTER_PRODUCTION }} \\"
+            echo "      --service ${{ vars.ECS_SERVICE_API_PRODUCTION }} \\"
+            echo "      --task-definition ${PREV_API:-<revision>}"
+            echo
+            echo "A rollback does NOT revert database migrations. Migrations are"
+            echo "additive by contract; a migration that is not backward"
+            echo "compatible with the previous image is a defect, not a"
+            echo "rollback problem (docs/cicd.md)."
+          } >> "$GITHUB_STEP_SUMMARY"

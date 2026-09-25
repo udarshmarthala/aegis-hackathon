@@ -1,0 +1,56 @@
+# FP-HR-002 - A scrape gap makes a metric look like a cliff
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: FP-HR-002
+title: A scrape gap makes a metric look like a cliff
+category: false_positive_alert
+workload: hotelreservation
+severity: P3
+difficulty: hard
+version: 1
+description: The metrics collector missed two scrape intervals. The resulting gap renders as a sudden drop in request rate, and an availability rule fires on an artefact of the monitoring system.
+tags:
+  - monitoring-artifact
+  - missing-data
+fault:
+  target: none
+  mode: none
+alert:
+  title: Profile request rate dropped to zero
+  severity: P3
+  service_hint: profile
+  metric: http_requests_total
+  labels:
+    alertname: TrafficDrop
+    window: 2m
+  annotations:
+    summary: request rate reported as zero for two intervals
+  fires_after_s: 60
+ground_truth:
+  affected_services: []
+  root_cause_service: null
+  root_cause_category: null
+  root_cause_statement: ""
+  causal_dependency: []
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: profile
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: profile
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: profile
+      required: false
+  expected_blast_radius: []
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+    - drain_instance
+  expected_safe_actions: []
+  expected_remediation_category: null
+  expected_verification_criteria: []
+  is_false_positive: true
+  notes: Logs and instance state both show continuous healthy serving through the window. Restarting on a monitoring artefact is a self-inflicted outage.

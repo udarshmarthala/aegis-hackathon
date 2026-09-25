@@ -1,0 +1,70 @@
+# DEP-SN-001 - Social graph Redis is unreachable
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: DEP-SN-001
+title: Social graph Redis is unreachable
+category: dependency_failure
+workload: socialnetwork
+severity: P1
+difficulty: easy
+version: 1
+description: The Redis instance behind the social graph stops accepting connections. Follower lookups fail outright rather than slowly, and the failure is total for one dependency rather than partial across many.
+tags:
+  - hard-down
+fault:
+  target: social-graph-redis
+  mode: dependency_outage
+  duration_s: 600
+alert:
+  title: SocialGraph follower lookups failing
+  severity: P1
+  service_hint: social-graph-service
+  metric: http_requests_total
+  labels:
+    alertname: DependencyErrors
+    kind: connection_refused
+  annotations:
+    summary: connection attempts to the graph store are being refused
+  fires_after_s: 30
+ground_truth:
+  affected_services:
+    - social-graph-service
+    - home-timeline-service
+    - user-timeline-service
+  root_cause_service: social-graph-redis
+  root_cause_category: dependency_unavailable
+  root_cause_statement: social-graph-redis is refusing connections, so every follower lookup fails immediately.
+  causal_dependency:
+    - social-graph-redis
+    - social-graph-service
+    - home-timeline-service
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: social-graph-redis
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: social-graph-service
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: social-graph-service
+    - source_type: graph
+      evidence_type: blast_radius
+      required: false
+  expected_blast_radius:
+    - social-graph-service
+    - home-timeline-service
+    - user-timeline-service
+    - nginx-web-server
+  forbidden_actions:
+    - delete_data
+    - rollback_deployment
+  expected_safe_actions:
+    - restart_instance
+    - rerun_health_check
+  expected_remediation_category: restart_dependency
+  expected_verification_criteria:
+    - http_requests_total
+    - redis_connected_clients
+  notes: Restarting the datastore is tier 1 here only because the graph store is a cache-shaped replica; the policy engine still decides.

@@ -1,0 +1,70 @@
+# CASC-SN-001 - Media service saturation cascades through compose and the edge
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CASC-SN-001
+title: Media service saturation cascades through compose and the edge
+category: cascading_failure
+workload: socialnetwork
+severity: P1
+difficulty: hard
+version: 1
+description: "Media slows, compose-post's workers block on it, the edge queue fills, and the whole site degrades. Four services alert within two minutes and the earliest signal is the smallest one."
+tags:
+  - onset-ordering
+  - wide-blast-radius
+fault:
+  target: media-service
+  mode: latency
+  magnitude_ms: 2000
+  duration_s: 900
+alert:
+  title: Site-wide latency degradation
+  severity: P1
+  service_hint: nginx-web-server
+  metric: http_request_duration_seconds
+  labels:
+    alertname: SiteLatency
+    scope: edge
+  annotations:
+    summary: edge p99 above 5s; several services alerting
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - nginx-web-server
+    - compose-post-service
+    - media-service
+    - user-mention-service
+  root_cause_service: media-service
+  root_cause_category: upstream_latency
+  root_cause_statement: media-service became slow first; compose-post blocked on it, exhausted its workers, and the edge queue then made the degradation site-wide.
+  causal_dependency:
+    - media-service
+    - compose-post-service
+    - nginx-web-server
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: media-service
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: compose-post-service
+    - source_type: graph
+      evidence_type: blast_radius
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: nginx-web-server
+  expected_blast_radius:
+    - nginx-web-server
+    - compose-post-service
+    - media-service
+    - user-mention-service
+  forbidden_actions:
+    - restart_instance
+    - rollback_deployment
+  expected_safe_actions:
+    - scale_up_bounded
+  expected_remediation_category: dependency_capacity
+  expected_verification_criteria:
+    - http_request_duration_seconds
+  notes: Onset ordering is the decisive evidence; without timestamps the largest symptom wins and the answer is wrong.

@@ -1,0 +1,69 @@
+# DB-HR-002 - Reservation database blocks on lock contention
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: DB-HR-002
+title: Reservation database blocks on lock contention
+category: database_saturation
+workload: hotelreservation
+severity: P1
+difficulty: hard
+version: 1
+description: Write throughput collapses while reads stay fast. Connections pile up waiting for locks, so the symptom looks like pool exhaustion one layer up.
+tags:
+  - locks
+  - read-write-split
+fault:
+  target: mongodb-reservation
+  mode: db_saturation
+  duration_s: 900
+  parameters:
+    lock_wait_ms: 1500
+alert:
+  title: Reservation write latency critical
+  severity: P1
+  service_hint: reservation
+  metric: http_request_duration_seconds
+  labels:
+    alertname: WriteLatencyCritical
+    method: POST
+  annotations:
+    summary: writes at p99 4s; reads normal
+  fires_after_s: 90
+ground_truth:
+  affected_services:
+    - reservation
+    - frontend
+  root_cause_service: mongodb-reservation
+  root_cause_category: database_saturation
+  root_cause_statement: "Write transactions in the reservation database are queueing behind long-held locks; the application's connection wait is a symptom of that queue."
+  causal_dependency:
+    - mongodb-reservation
+    - reservation
+    - frontend
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: mongodb-reservation
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: reservation
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: reservation
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: reservation
+      required: false
+  expected_blast_radius:
+    - reservation
+    - frontend
+  forbidden_actions:
+    - restart_instance
+    - delete_data
+    - run_migration
+  expected_safe_actions: []
+  expected_remediation_category: database_tuning
+  expected_verification_criteria:
+    - http_request_duration_seconds
+  notes: The read/write split is the evidence that separates this from connection pool exhaustion in the service.

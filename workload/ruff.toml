@@ -1,0 +1,14 @@
+# The workload is not part of the backend package, but it is production code in
+# the sense that matters here: a benchmark whose fault injector is sloppy
+# produces numbers nobody should trust. It is therefore held to the same lint
+# rules as backend/, mirrored rather than imported because ruff resolves
+# configuration from the file's own directory tree.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "RET", "SIM", "ARG", "ASYNC", "S", "T20"]
+ignore = [
+  "S101",  # assert is used for internal invariants, not input validation
+  "B008",  # FastAPI Depends() in defaults is the framework idiom
+]

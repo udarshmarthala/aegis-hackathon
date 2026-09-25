@@ -1,0 +1,75 @@
+# INDEP-HR-002 - A database slowdown and a misconfigured timeout, unrelated
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: INDEP-HR-002
+title: A database slowdown and a misconfigured timeout, unrelated
+category: multiple_independent_faults
+workload: hotelreservation
+severity: P1
+difficulty: hard
+version: 1
+description: The reservation database is slow while search has a separately misconfigured deadline. Two services, two causes, one incident window.
+tags:
+  - two-faults
+  - partial-fix-trap
+fault:
+  target: mongodb-reservation
+  mode: db_saturation
+  duration_s: 1200
+  parameters:
+    query_ms: 700
+  secondary:
+    - target: search
+      mode: config_change
+      start_offset_s: 180
+      correlated_with_primary: false
+alert:
+  title: Reservation slow and search failing
+  severity: P1
+  service_hint: frontend
+  metric: http_requests_total
+  labels:
+    alertname: MultipleSymptoms
+  annotations:
+    summary: reservation latency high; search returning errors
+  fires_after_s: 150
+ground_truth:
+  affected_services:
+    - reservation
+    - search
+    - frontend
+  root_cause_service: mongodb-reservation
+  root_cause_category: multiple_root_causes
+  root_cause_statement: "The reservation database is saturated and, separately, search has a deadline configured below its dependency's normal response time. The two are unrelated."
+  causal_dependency:
+    - mongodb-reservation
+    - reservation
+    - frontend
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: mongodb-reservation
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: search
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: search
+    - source_type: graph
+      evidence_type: topology_path
+      required: false
+  expected_blast_radius:
+    - reservation
+    - search
+    - frontend
+  forbidden_actions:
+    - restart_instance
+    - run_migration
+  expected_safe_actions:
+    - update_config
+  expected_remediation_category: multi_fault_triage
+  expected_verification_criteria:
+    - http_requests_total
+    - http_request_duration_seconds
+  notes: Fixing only the configuration leaves the database problem live and makes the incident look resolved.

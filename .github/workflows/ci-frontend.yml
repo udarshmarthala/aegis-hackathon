@@ -1,0 +1,79 @@
+# Frontend CI. One job: npm ci dominates the wall clock, so splitting lint,
+# typecheck and build across jobs would triple the install cost to save nothing.
+name: ci-frontend
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/ci-frontend.yml"
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/ci-frontend.yml"
+
+concurrency:
+  group: ci-frontend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: frontend
+
+jobs:
+  verify:
+    name: lint + types + build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Build-time public config. These identify a Firebase project; they do
+      # not authorize anything (see frontend/Dockerfile). CI builds against
+      # placeholders so a PR from a fork still compiles.
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_AEGIS_ENV: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: frontend/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**/*.[jt]s', 'frontend/src/**/*.[jt]sx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
+
+      - name: eslint
+        run: npm run lint
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: next build
+        run: npm run build
+
+      # There is no test runner in package.json today. Detect one rather than
+      # hardcoding a green "tests passed" step that runs nothing.
+      - name: Unit tests
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+            npm test -- --run
+          else
+            echo "::warning title=No frontend test runner::package.json defines no test script; frontend unit coverage is 0."
+          fi

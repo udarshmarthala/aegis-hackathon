@@ -1,0 +1,69 @@
+# MEM-REF-003 - Checkout memory grows only while payment is slow
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: MEM-REF-003
+title: Checkout memory grows only while payment is slow
+category: memory_pressure
+workload: reference
+severity: P2
+difficulty: hard
+version: 1
+description: Checkout buffers in-flight requests. When payment slows, the buffer grows and checkout looks like it is leaking. The memory symptom is downstream of a latency cause, and naming checkout is the trap.
+tags:
+  - symptom-not-cause
+  - correlation-trap
+fault:
+  target: payment
+  mode: latency
+  magnitude_ms: 900
+  duration_s: 900
+alert:
+  title: Checkout memory climbing
+  severity: P2
+  service_hint: checkout
+  metric: container_memory_usage_bytes
+  labels:
+    alertname: MemoryGrowth
+    env: local
+  annotations:
+    summary: "RSS up 60% over 15 minutes"
+  fires_after_s: 300
+ground_truth:
+  affected_services:
+    - checkout
+    - payment
+    - gateway
+  root_cause_service: payment
+  root_cause_category: upstream_latency
+  root_cause_statement: "payment's added latency keeps requests in flight inside checkout; the memory growth is a consequence of queueing, not of a leak in checkout."
+  causal_dependency:
+    - payment
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: payment
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: checkout
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: checkout
+    - source_type: graph
+      evidence_type: topology_path
+      required: false
+  expected_blast_radius:
+    - checkout
+    - gateway
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+  expected_safe_actions:
+    - rerun_health_check
+  expected_remediation_category: dependency_capacity
+  expected_verification_criteria:
+    - container_memory_usage_bytes
+    - http_request_duration_seconds
+  notes: Correlation puts the symptom on checkout; causality puts it on payment. This scenario exists to tell those two apart.

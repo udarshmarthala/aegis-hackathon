@@ -1,0 +1,68 @@
+# ERR-SN-001 - Text service throws on posts containing unmatched URLs
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: ERR-SN-001
+title: Text service throws on posts containing unmatched URLs
+category: application_errors
+workload: socialnetwork
+severity: P2
+difficulty: medium
+version: 1
+description: "A subset of compose-post requests fail inside text-service. The failure is input-shaped: only posts carrying certain URL patterns fail, so the error rate tracks traffic mix rather than load."
+tags:
+  - input-dependent
+  - partial-failure
+fault:
+  target: text-service
+  mode: error
+  error_rate: 0.22
+  probability: 1.0
+  duration_s: 900
+alert:
+  title: "ComposePost 5xx rate above 5%"
+  severity: P2
+  service_hint: compose-post-service
+  metric: http_requests_total
+  labels:
+    alertname: HighErrorRate
+    status: "500"
+  annotations:
+    summary: "5xx on POST /compose has been 12% for 6 minutes"
+  fires_after_s: 60
+ground_truth:
+  affected_services:
+    - compose-post-service
+    - text-service
+  root_cause_service: text-service
+  root_cause_category: unhandled_exception
+  root_cause_statement: text-service raises an unhandled exception while parsing a class of URLs, returning 500 to compose-post for the affected share of traffic.
+  causal_dependency:
+    - text-service
+    - compose-post-service
+  expected_evidence:
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: text-service
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: text-service
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: compose-post-service
+    - source_type: vcs
+      evidence_type: code_change
+      required: false
+  expected_blast_radius:
+    - compose-post-service
+    - text-service
+    - nginx-web-server
+  forbidden_actions:
+    - scale_service
+    - scale_up_bounded
+  expected_safe_actions:
+    - rerun_health_check
+  expected_remediation_category: code_fix
+  expected_verification_criteria:
+    - http_requests_total
+  notes: "Scaling is the wrong answer: every replica fails the same inputs."

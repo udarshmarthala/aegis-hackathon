@@ -1,0 +1,385 @@
+# Aegis 2.0 - local production simulator.
+#   docker compose -f infra/docker/docker-compose.yml --project-name aegis-2.0 up -d
+#
+# Profiles keep startup reliable:
+#   (default)       datastores + api + worker + web
+#   observability   otel collector, prometheus, tempo, loki
+#   workload        the instrumented reference application Aegis observes
+#
+# Only postgres is a hard dependency. Every other service can be absent and
+# Aegis degrades into recorded evidence gaps rather than failing.
+
+name: aegis-2-0
+
+x-common-env: &common-env
+  AEGIS_ENV: ${AEGIS_ENV:-local}
+  AEGIS_ENVIRONMENT_NAME: ${AEGIS_ENVIRONMENT_NAME:-local-docker}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-aegis}
+  POSTGRES_USER: ${POSTGRES_USER:-aegis}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: ${NEO4J_USER:-neo4j}
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+  PROMETHEUS_URL: http://prometheus:9090
+  TEMPO_URL: http://tempo:3200
+  LOKI_URL: http://loki:3100
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_TRACES_ENABLED: ${OTEL_TRACES_ENABLED:-true}
+  ALERT_INGEST_TOKEN: ${ALERT_INGEST_TOKEN:?ALERT_INGEST_TOKEN must be set in .env}
+  INTERNAL_SIGNING_KEY: ${INTERNAL_SIGNING_KEY:-}
+  # One vendor, up to four keys. All four are passed even when empty: a key the
+  # operator set in .env but that never reached the container is worse than an
+  # absent one, because the ring silently runs at reduced width.
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  GOOGLE_API_KEY_2: ${GOOGLE_API_KEY_2:-}
+  GOOGLE_API_KEY_3: ${GOOGLE_API_KEY_3:-}
+  GOOGLE_API_KEY_4: ${GOOGLE_API_KEY_4:-}
+  GOOGLE_BASE_URL: ${GOOGLE_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+  LLM_MAX_OUTPUT_TOKENS: ${LLM_MAX_OUTPUT_TOKENS:-8192}
+  LLM_MODEL_FAST: ${LLM_MODEL_FAST:-gemini-3.6-flash}
+  LLM_MODEL_REASONING: ${LLM_MODEL_REASONING:-gemini-3.6-flash}
+  LLM_MODEL_CODE: ${LLM_MODEL_CODE:-gemini-3.6-flash}
+  LLM_EMBEDDING_MODEL: ${LLM_EMBEDDING_MODEL:-gemini-embedding-001}
+  LLM_EMBEDDING_DIM: ${LLM_EMBEDDING_DIM:-1536}
+  LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+  LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+  LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-aegis-2.0}
+  # GitHub and Slack were configured in .env but never reached the containers,
+  # so change analysis reported "github is not configured" on a machine where a
+  # token was sitting right there. A capability that is configured and unused is
+  # worse than one that is absent - it looks like a product gap.
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_DEFAULT_OWNER: ${GITHUB_DEFAULT_OWNER:-}
+  GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+  SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+  FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+  FIREBASE_SERVICE_ACCOUNT_PATH: /run/secrets/firebase-service-account.json
+  AUTH_DEV_MODE: ${AUTH_DEV_MODE:-true}
+  AUTH_DEV_BYPASS_TOKEN: ${AUTH_DEV_BYPASS_TOKEN:-}
+  AUTONOMY_ENABLED: ${AUTONOMY_ENABLED:-false}
+  AUTONOMY_MODE: ${AUTONOMY_MODE:-guarded}
+  AUTONOMY_ALLOWED_TIERS: ${AUTONOMY_ALLOWED_TIERS:-1}
+  WORKLOAD_ADAPTER: ${WORKLOAD_ADAPTER:-compose}
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------ datastores --
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: *restart
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aegis}
+      POSTGRES_USER: ${POSTGRES_USER:-aegis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      # Deterministic collation avoids index corruption across glibc upgrades.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - log_min_duration_statement=2000
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Published on 55433. Two ports are deliberately avoided: 5432, which a
+      # natively installed PostgreSQL usually owns (the native listener beats
+      # Docker's proxy, so you authenticate against a database you did not
+      # mean to reach), and 55432, the obvious second choice, which was found
+      # held by an unrelated project on a dev machine - the same failure with
+      # a less obvious cause. Containers still reach each other on 5432 over
+      # the compose network; only the host mapping moves.
+      - "${POSTGRES_PUBLISH_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aegis} -d ${POSTGRES_DB:-aegis}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7.4-alpine
+    <<: *restart
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      # Redis is a cache and a bus, never a system of record, so evicting under
+      # pressure is correct behaviour rather than data loss.
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_PUBLISH_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5.26-community
+    <<: *restart
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j-data:/data
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  # ----------------------------------------------------------- aegis core --
+  api:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    image: aegis-2.0-backend:latest
+    <<: *restart
+    # A hand-curated environment list silently drops every setting nobody
+    # remembered to add - which is how GITHUB_TOKEN and LLM_REQUEST_TIMEOUT_S sat
+    # correctly configured in .env while the containers ran without them. Each
+    # service now loads the whole file, and the explicit `environment:` block below
+    # still wins, which is what keeps the container-network hostnames (postgres,
+    # redis, neo4j) overriding whatever a developer has in .env for host-side tools.
+    env_file:
+      - ../../.env
+    environment:
+      <<: *common-env
+      OTEL_SERVICE_NAME: aegis-api
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+    secrets:
+      - firebase-service-account.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "${API_PUBLISH_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  worker:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    image: aegis-2.0-backend:latest
+    <<: *restart
+    command: ["python", "-m", "aegis.worker.main", "--concurrency", "${WORKER_CONCURRENCY:-2}"]
+    # A hand-curated environment list silently drops every setting nobody
+    # remembered to add - which is how GITHUB_TOKEN and LLM_REQUEST_TIMEOUT_S sat
+    # correctly configured in .env while the containers ran without them. Each
+    # service now loads the whole file, and the explicit `environment:` block below
+    # still wins, which is what keeps the container-network hostnames (postgres,
+    # redis, neo4j) overriding whatever a developer has in .env for host-side tools.
+    env_file:
+      - ../../.env
+    environment:
+      <<: *common-env
+      OTEL_SERVICE_NAME: aegis-worker
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+    secrets:
+      - firebase-service-account.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    # The worker serves no HTTP; the image healthcheck is for the API. Liveness
+    # is observable through job throughput and the queue depth instead.
+    healthcheck:
+      disable: true
+    # SIGTERM drains in-flight investigations; give the worker room to finish.
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  web:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+        NEXT_PUBLIC_AEGIS_ENV: ${AEGIS_ENV:-local}
+        NEXT_PUBLIC_FIREBASE_API_KEY: ${NEXT_PUBLIC_FIREBASE_API_KEY:-}
+        NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-}
+        NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${NEXT_PUBLIC_FIREBASE_PROJECT_ID:-}
+        NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: ${NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET:-}
+        NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: ${NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID:-}
+        NEXT_PUBLIC_FIREBASE_APP_ID: ${NEXT_PUBLIC_FIREBASE_APP_ID:-}
+    image: aegis-2.0-web:latest
+    <<: *restart
+    environment:
+      NODE_ENV: production
+      AEGIS_API_INTERNAL_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "${WEB_PUBLISH_PORT:-3000}:3000"
+    healthcheck:
+      # 127.0.0.1, not localhost: the container resolves localhost to ::1 first
+      # while Next.js binds IPv4 only, which fails an otherwise healthy service.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------- observability --
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    <<: *restart
+    profiles: ["observability"]
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ../otel/collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    <<: *restart
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+      # Generated by eval/topology.py; file_sd picks changes up without a restart.
+      - ../prometheus/targets:/etc/prometheus/targets:ro
+    ports:
+      - "${PROMETHEUS_PUBLISH_PORT:-9090}:9090"
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    <<: *restart
+    profiles: ["observability"]
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../otel/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:3.3.2
+    <<: *restart
+    profiles: ["observability"]
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+
+  # ------------------------------------------------------------- workload --
+  # The instrumented reference application Aegis observes. It is a separate
+  # concern from Aegis itself: faults are injected here, never in Aegis, so a
+  # benchmark cannot hand the agent privileged knowledge of the fault
+  # (ESD section 16).
+  gateway:
+    build: { context: ../../workload }
+    image: aegis-2.0-workload:latest
+    <<: *restart
+    profiles: ["workload"]
+    environment:
+      SERVICE_NAME: gateway
+      DOWNSTREAM: checkout
+    labels:
+      aegis.service: gateway
+      aegis.topology: workload
+      aegis.kind: service
+    ports:
+      - "${GATEWAY_PUBLISH_PORT:-8080}:8080"
+      # Benchmark port allocated by eval/topologies/reference.yaml. Without
+      # it a scenario faulting this service could only be injected from
+      # inside the compose network, which the harness is not.
+      - "18001:8080"
+
+  checkout:
+    build: { context: ../../workload }
+    image: aegis-2.0-workload:latest
+    <<: *restart
+    profiles: ["workload"]
+    environment:
+      SERVICE_NAME: checkout
+      DOWNSTREAM: payment
+    labels:
+      aegis.service: checkout
+      aegis.topology: workload
+      aegis.kind: service
+    ports:
+      # Benchmark port allocated by eval/topologies/reference.yaml. Without
+      # it a scenario faulting this service could only be injected from
+      # inside the compose network, which the harness is not.
+      - "18000:8080"
+
+  payment:
+    build: { context: ../../workload }
+    image: aegis-2.0-workload:latest
+    <<: *restart
+    profiles: ["workload"]
+    environment:
+      SERVICE_NAME: payment
+      DOWNSTREAM: ""
+    labels:
+      aegis.service: payment
+      aegis.topology: workload
+      aegis.kind: service
+    ports:
+      # Benchmark port allocated by eval/topologies/reference.yaml. Without
+      # it a scenario faulting this service could only be injected from
+      # inside the compose network, which the harness is not.
+      - "18002:8080"
+
+  # Continuous traffic so the metrics Aegis queries actually exist.
+  loadgen:
+    image: alpine:3.21
+    <<: *restart
+    profiles: ["workload"]
+    depends_on: [gateway]
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache curl >/dev/null 2>&1; while true; do curl -s -o /dev/null http://gateway:8080/work; sleep 0.4; done"
+
+volumes:
+  postgres-data:
+  neo4j-data:
+  prometheus-data:
+  tempo-data:
+
+secrets:
+  firebase-service-account.json:
+    file: ../../.secrets/firebase-service-account.json

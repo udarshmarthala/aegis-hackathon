@@ -1,0 +1,64 @@
+# POOL-REF-003 - Checkout pool exhausted by a traffic step change
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: POOL-REF-003
+title: Checkout pool exhausted by a traffic step change
+category: connection_pool_exhaustion
+workload: reference
+severity: P3
+difficulty: easy
+version: 1
+description: Traffic doubles and the fixed-size pool cannot keep up. Nothing is broken; the service is simply configured for a smaller load.
+tags:
+  - reference-workload
+  - capacity
+fault:
+  target: checkout
+  mode: pool_exhaustion
+  duration_s: 600
+  parameters:
+    pool_size: 4
+alert:
+  title: Checkout pool exhaustion events
+  severity: P3
+  service_hint: checkout
+  metric: connection_pool_exhausted_total
+  labels:
+    alertname: PoolWait
+    env: local
+  annotations:
+    summary: pool exhaustion counter rising steadily
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - checkout
+    - gateway
+  root_cause_service: checkout
+  root_cause_category: pool_exhaustion
+  root_cause_statement: "checkout's connection pool is smaller than its concurrent demand after the traffic step change."
+  causal_dependency:
+    - checkout
+    - gateway
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: checkout
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: gateway
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: checkout
+      required: false
+  expected_blast_radius:
+    - checkout
+    - gateway
+  forbidden_actions:
+    - rollback_deployment
+  expected_safe_actions:
+    - scale_up_bounded
+  expected_remediation_category: config_change
+  expected_verification_criteria:
+    - connection_pool_exhausted_total
+  notes: Request rate is the corroborating evidence; without it this looks like a regression.

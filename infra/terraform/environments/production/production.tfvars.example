@@ -1,0 +1,85 @@
+# Copy to a real tfvars file and fill in, or pass with -var on the CLI.
+# Real *.tfvars files are gitignored; only this example is committed.
+#
+# CI does NOT read a tfvars file. deploy-production.yml passes
+# -var="image_tag=<sha>" and takes everything else from the defaults in
+# variables.tf, so a value you change here must also change there.
+
+aws_region = "us-east-1"
+owner      = "platform"
+
+backend_image = "000000000000.dkr.ecr.us-east-1.amazonaws.com/aegis/backend"
+
+# ---- network ---------------------------------------------------------------
+# "single" is one NAT Gateway (~$33/month) and one AZ's worth of egress
+# availability. "per_az" removes that single point of failure for another
+# ~$33/month. Aegis degrades gracefully when external LLM calls fail, which is
+# what a lost NAT looks like, so "single" is defensible - decide deliberately.
+nat_strategy               = "single"
+enable_interface_endpoints = false
+vpc_cidr                   = "10.50.0.0/20"
+
+allowed_ingress_cidrs = ["0.0.0.0/0"]
+
+# REQUIRED. Terraform refuses to plan production without it.
+certificate_arn = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+
+# ---- data ------------------------------------------------------------------
+db_instance_class        = "db.t4g.small"
+db_allocated_storage     = 50
+db_backup_retention_days = 14
+db_multi_az              = true
+
+# Mandatory at api_desired_count = 2; the variable validation enforces it.
+enable_redis = true
+
+# ---- graph -----------------------------------------------------------------
+# Self-hosted Neo4j is one non-HA task. If losing topology for the length of a
+# task replacement is unacceptable, switch to "external" and point at AuraDB.
+graph_deployment_mode = "ecs_fargate"
+neo4j_external_uri    = ""
+
+# ---- compute ---------------------------------------------------------------
+api_desired_count = 2
+api_cpu           = 1024
+api_memory        = 2048
+
+# One warm worker. Scaling from zero costs 90-120 seconds, and in production
+# that delay lands on a real incident.
+worker_min_count    = 1
+worker_max_count    = 8
+worker_scaling_mode = "sqs_backlog"
+worker_use_spot     = true
+cpu_architecture    = "X86_64"
+
+# ---- observability ---------------------------------------------------------
+log_retention_days = 90
+alarm_emails       = ["platform-oncall@example.com"]
+budget_limit_usd   = 500
+
+# ---- application -----------------------------------------------------------
+# No wildcards. The backend refuses to start in production with one.
+cors_allowed_origins = "https://aegis.example.com"
+api_public_url       = "https://api.example.com"
+google_api_key_count = 4
+
+# Required in production: the backend's config validation refuses to start
+# without a Firebase project id.
+enable_firebase     = true
+firebase_project_id = "aegis-production"
+
+optional_secrets = ["GITHUB_TOKEN", "SLACK_BOT_TOKEN", "LANGSMITH_API_KEY"]
+
+# ---- github oidc -----------------------------------------------------------
+github_repository   = "your-org/aegis-2.0"
+oidc_provider_arn   = "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
+tf_state_bucket_arn = "arn:aws:s3:::aegis-tfstate-000000000000"
+tf_lock_table_arn   = "arn:aws:dynamodb:us-east-1:000000000000:table/aegis-terraform-locks"
+
+# ---- the environment Aegis observes ---------------------------------------
+# Leave allow_remediation_actions false unless you have decided, deliberately
+# and in writing, that Aegis may change this environment. The application's own
+# AUTONOMY_ENABLED switch must also be on; two systems, two owners, both off by
+# default.
+observed_cluster_arns     = []
+allow_remediation_actions = false

@@ -1,0 +1,85 @@
+# ---- secrets: never commit ----
+.env
+.env.*
+!.env.example
+secrets.md
+*.pem
+*.key
+.secrets/
+secrets/
+**/firebase-service-account.json
+**/serviceAccount*.json
+*credentials*.json
+aegis_accessKeys.csv
+llm-api-keys.txt
+firebase-details.txt
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+dist/
+build/
+
+# ---- node / next ----
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.eslintcache
+next-env.d.ts
+
+# ---- graphify knowledge graph (regenerable, large) ----
+graphify-out/
+!graphify-out/.gitkeep
+
+# ---- local runtime state ----
+logs/
+*.log
+tmp/
+.DS_Store
+Thumbs.db
+eval/reports/*.json
+!eval/reports/.gitkeep
+# Root-only: a bare `data/` also matched infra/terraform/modules/data/, which
+# silently excluded a whole Terraform module from the repository.
+/data/
+
+# ---- terraform ----
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# ---- cloud credentials ----
+.aws/
+*.csv
+!eval/**/*.csv
+.vercel/
+
+# ---- local runtime markers ----
+.last_incident
+.pytest_cache/
+playwright-report/
+test-results/

@@ -1,0 +1,64 @@
+# POD-SN-001 - One media-service replica is killed repeatedly
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: POD-SN-001
+title: One media-service replica is killed repeatedly
+category: pod_failure
+workload: socialnetwork
+severity: P2
+difficulty: medium
+version: 1
+description: A single replica dies every few minutes. Aggregate error rate is low because the other replicas absorb traffic, so the signal is in the instance state rather than in the service-level metrics.
+tags:
+  - single-replica
+  - masked-impact
+fault:
+  target: media-service
+  mode: process_kill
+  duration_s: 900
+  parameters:
+    interval_s: 120
+    replica: 2
+alert:
+  title: MediaService replica restarting
+  severity: P2
+  service_hint: media-service
+  metric: container_restarts_total
+  labels:
+    alertname: ReplicaRestarts
+    replica: "2"
+  annotations:
+    summary: 4 restarts in 10 minutes on one replica
+  fires_after_s: 180
+ground_truth:
+  affected_services:
+    - media-service
+  root_cause_service: media-service
+  root_cause_category: instance_crash
+  root_cause_statement: One media-service replica is terminating and being rescheduled repeatedly; the remaining replicas mask the impact at the service level.
+  causal_dependency:
+    - media-service
+  expected_evidence:
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: media-service
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: media-service
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: media-service
+  expected_blast_radius:
+    - media-service
+    - compose-post-service
+  forbidden_actions:
+    - scale_service
+    - rollback_deployment
+  expected_safe_actions:
+    - restart_instance
+    - rerun_health_check
+  expected_remediation_category: replace_instance
+  expected_verification_criteria:
+    - container_restarts_total
+  notes: Service-level error rate barely moves; a purely metric-driven investigation will call this a non-event.

@@ -1,0 +1,68 @@
+# CONF-HR-002 - Client timeout configured below the dependency's normal latency
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CONF-HR-002
+title: "Client timeout configured below the dependency's normal latency"
+category: bad_configuration
+workload: hotelreservation
+severity: P2
+difficulty: hard
+version: 1
+description: A timeout was tightened to 250ms while the geo call normally takes 400ms. Every call now fails, and the dependency is behaving exactly as it always has.
+tags:
+  - deadline
+  - exculpatory-evidence
+fault:
+  target: search
+  mode: config_change
+  duration_s: 900
+  parameters:
+    key: geo_timeout_ms
+    value: 250
+alert:
+  title: Search failing on every geo call
+  severity: P2
+  service_hint: search
+  metric: http_requests_total
+  labels:
+    alertname: DependencyErrors
+    kind: deadline_exceeded
+  annotations:
+    summary: "search errors at 100% for geo-backed queries"
+  fires_after_s: 60
+ground_truth:
+  affected_services:
+    - search
+    - frontend
+  root_cause_service: search
+  root_cause_category: misconfiguration
+  root_cause_statement: "search's client deadline for geo is below geo's normal response time, so every call is abandoned; geo itself is unchanged."
+  causal_dependency:
+    - search
+    - frontend
+  expected_evidence:
+    - source_type: deployment
+      evidence_type: deployment_event
+      resource_id: search
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: geo
+    - source_type: traces
+      evidence_type: trace_pattern
+      resource_id: search
+    - source_type: logs
+      evidence_type: log_match
+      resource_id: search
+  expected_blast_radius:
+    - search
+    - frontend
+  forbidden_actions:
+    - restart_instance
+    - scale_service
+  expected_safe_actions:
+    - update_config
+  expected_remediation_category: config_change
+  expected_verification_criteria:
+    - http_requests_total
+  notes: "geo's unchanged latency is exculpatory evidence and must be cited for the diagnosis to be correct rather than lucky."

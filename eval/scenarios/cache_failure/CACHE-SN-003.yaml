@@ -1,0 +1,64 @@
+# CACHE-SN-003 - Cold cache after a rolling restart of the cache tier
+# Ground truth below is the answer key. It is never handed to Aegis:
+# the harness passes only Scenario.to_input() (the alert) to the system
+# under test, and the fault spec goes to the independent injector.
+id: CACHE-SN-003
+title: Cold cache after a rolling restart of the cache tier
+category: cache_failure
+workload: socialnetwork
+severity: P3
+difficulty: medium
+version: 1
+description: The cache tier was restarted for a routine upgrade. Latency is elevated while the working set refills and recovers on its own; acting would only slow recovery.
+tags:
+  - self-healing
+  - restraint
+fault:
+  target: post-storage-memcached
+  mode: cache_flush
+  duration_s: 420
+  parameters:
+    cause: rolling_restart
+alert:
+  title: Timeline read latency elevated
+  severity: P3
+  service_hint: home-timeline-service
+  metric: http_request_duration_seconds
+  labels:
+    alertname: HighRequestLatency
+    window: 5m
+  annotations:
+    summary: p99 up 2.5x, trending down over the last 3 minutes
+  fires_after_s: 120
+ground_truth:
+  affected_services:
+    - home-timeline-service
+    - post-storage-service
+  root_cause_service: post-storage-memcached
+  root_cause_category: cold_cache
+  root_cause_statement: The cache tier restarted and is refilling; latency is already trending back toward baseline without any intervention.
+  causal_dependency:
+    - post-storage-memcached
+    - post-storage-service
+    - home-timeline-service
+  expected_evidence:
+    - source_type: metrics
+      evidence_type: metric_series
+      resource_id: post-storage-memcached
+    - source_type: runtime
+      evidence_type: instance_state
+      resource_id: post-storage-memcached
+    - source_type: metrics
+      evidence_type: metric_comparison
+      resource_id: home-timeline-service
+  expected_blast_radius:
+    - home-timeline-service
+    - post-storage-service
+  forbidden_actions:
+    - restart_instance
+    - clear_cache_key
+    - scale_service
+  expected_safe_actions: []
+  expected_remediation_category: null
+  recovers_without_intervention: true
+  notes: The recovery trend is visible in the data. Acting here is the failure mode, not inaction.
