@@ -3,7 +3,7 @@
 # Multi-stage so the runtime layer carries no build toolchain.
 
 # ---------- builder ----------------------------------------------------------
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -33,7 +33,7 @@ RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip uninstall --yes pip setuptools wheel
 
 # ---------- runtime ----------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
