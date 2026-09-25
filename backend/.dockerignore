@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 tests/
+# ...except the committed fallback fixtures the running service reads.
+!tests/fixtures/
 htmlcov/
 .coverage
 *.egg-info/

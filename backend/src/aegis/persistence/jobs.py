@@ -136,6 +136,33 @@ class JobQueue:
             log.warning("reaped stale jobs", count=count)
         return count
 
+    async def reclaim_own(self, worker_id: str) -> int:
+        """Requeue jobs a previous incarnation of *this* worker was holding.
+
+        Run once at startup, before the first claim. A container restarted after
+        a hard kill keeps its hostname, and therefore its worker id, so anything
+        still 'running' under that id belongs to a process that no longer
+        exists. Waiting for ``reap_stale`` would strand the incident for fifteen
+        minutes; the checkpoint makes resuming it immediately safe.
+
+        Never touches another worker's jobs: a live peer is indistinguishable
+        from a dead one here, which is exactly why the reaper waits.
+        """
+        result = await self._db.execute(
+            """
+            UPDATE workflow_jobs
+               SET status='queued', locked_by=NULL, locked_at=NULL,
+                   run_after=now(), updated_at=now()
+             WHERE status='running' AND locked_by = $1
+            """,
+            worker_id,
+        )
+        count = int(result.split()[-1]) if result.startswith("UPDATE") else 0
+        if count:
+            log.warning("reclaimed jobs from a previous run of this worker",
+                        worker_id=worker_id, count=count)
+        return count
+
     async def stats(self) -> dict[str, int]:
         rows = await self._db.fetch(
             "SELECT status, count(*) AS n FROM workflow_jobs GROUP BY status"

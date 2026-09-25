@@ -39,3 +39,19 @@ scrape_configs:
     file_sd_configs:
       - files: ["/etc/prometheus/targets/*.yml"]
         refresh_interval: 10s
+
+  # The reference chain again, by Compose service name rather than host port.
+  # A redeploy or rollback recreates a container, and the replacement cannot
+  # bind the host port while the old one still holds it - so the file_sd
+  # target above goes dark after the first recreate. The service DNS alias
+  # follows the replacement. Ratios and quantiles are unaffected by the second
+  # copy of each series; rates are read per job where it matters.
+  - job_name: workload-dns
+    honor_labels: true
+    static_configs:
+      - targets: ["gateway:8080"]
+        labels: { service: gateway, topology: reference-dns }
+      - targets: ["checkout:8080"]
+        labels: { service: checkout, topology: reference-dns }
+      - targets: ["payment:8080"]
+        labels: { service: payment, topology: reference-dns }

@@ -4,14 +4,16 @@
 name: ci-backend
 
 on:
+  # No path filter on pull requests: these job names are required status
+  # checks, and a required check whose workflow never starts leaves a PR that
+  # touches only other paths waiting forever.
   pull_request:
-    paths:
-      - "backend/**"
-      - ".github/workflows/ci-backend.yml"
   push:
     branches: [main]
     paths:
       - "backend/**"
+      # The unit suite also exercises the reference workload's fault modes.
+      - "workload/**"
       - ".github/workflows/ci-backend.yml"
 
 # A PR that is pushed to twice in a minute should not burn two full integration

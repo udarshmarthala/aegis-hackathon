@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
 
+from aegis.api.metrics import install_metrics
 from aegis.api.routers import (
     actions,
     alerts,
@@ -35,6 +36,7 @@ from aegis.api.routers import (
     stream,
     systems,
     tasks,
+    war_room,
 )
 from aegis.container import build_container
 from aegis.core.config import Settings, get_settings
@@ -71,6 +73,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.incidents = container.incidents
     app.state.evidence = container.evidence
     app.state.redis = container.redis
+    # The war room reads checkpoints, events and the brain's readiness; the
+    # worker owns the write side of all three.
+    app.state.horizon_store = container.horizon_store
+    app.state.brain = container.brain
 
     from aegis.api.security import FirebaseVerifier
 
@@ -172,9 +178,12 @@ def create_app() -> FastAPI:
     for module in (
         alerts, incidents, stream, policy_admin, actions, approvals, audit,
         deployments, evaluation, graph, integrations, investigations, reliability,
-        systems, tasks,
+        systems, tasks, war_room,
     ):
         app.include_router(module.router, prefix="/v1")
+    # Last: the health router already serves /metrics, and installing after it
+    # attaches these series to that endpoint instead of shadowing it.
+    install_metrics(app)
 
     if settings.otel_traces_enabled:
         try:

@@ -35,6 +35,11 @@ dependencies = [
   "prometheus-client>=0.21.0",
   "docker>=7.1.0",
   "pyyaml>=6.0.2",
+  # The horizon brain: Claude on Bedrock through the Anthropic SDK (SigV4 via
+  # boto3/botocore), and the MCP client for remote toolsets.
+  "anthropic[bedrock]>=0.70",
+  "boto3>=1.35",
+  "mcp>=1.9",
 
   # Transitive, pinned here on purpose. firebase-admin -> cachecontrol pulls
   # msgpack with a floor of 0.5.2, which resolves to 1.1.2 and carries

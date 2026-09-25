@@ -31,8 +31,10 @@ typed error naming the reason - it never pretends to have looked.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
+import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -66,6 +68,14 @@ MAX_REPLICAS: Final = 10
 # reclaim its own replicas and will never remove the operator's original.
 AEGIS_MANAGED_LABEL: Final = "io.aegis.managed"
 COMPOSE_PROJECT_LABEL: Final = "com.docker.compose.project"
+# Docker's built-in networks; never part of a Compose project's topology.
+_DOCKER_BUILTIN_NETWORKS: Final = frozenset({"bridge", "host", "none"})
+# Labels that describe an image build rather than a deployment decision.
+_IMAGE_OWNED_LABEL_PREFIXES: Final = (
+    "aegis.version",
+    "aegis.dependency",
+    "org.opencontainers.image.",
+)
 COMPOSE_SERVICE_LABEL: Final = "com.docker.compose.service"
 
 # infra/docker/docker-compose.yml pins ``name: aegis-2-0``, so that is the
@@ -603,7 +613,12 @@ class ComposeAdapter(RuntimeAdapter):
         out: list[ServiceState] = []
         for service, instances in sorted(grouped.items()):
             ready = sum(1 for i in instances if i.health is ServiceHealth.HEALTHY)
-            version = next((i.version for i in instances if i.version), None)
+            # A version is what is *serving*: a created-but-never-started or
+            # exited container must not report its image as the live version.
+            running = [i for i in instances if i.raw_status.startswith("running")]
+            version = next((i.version for i in running if i.version), None) or next(
+                (i.version for i in instances if i.version), None
+            )
             out.append(
                 ServiceState(
                     ref=self._ref(service),
@@ -929,19 +944,72 @@ class ComposeAdapter(RuntimeAdapter):
     ) -> str:
         attrs = getattr(template, "attrs", {}) or {}
         config = _as_dict(attrs.get("Config"))
-        attached = list((_as_dict(attrs.get("NetworkSettings")).get("Networks") or {}).keys())
-        labels = dict(getattr(template, "labels", {}) or {})
+        networks = list(_as_dict(_as_dict(attrs.get("NetworkSettings")).get("Networks")))
+        # Docker's own networks are not the project's: a clone of a clone would
+        # otherwise try to join ``bridge`` twice and fail the second redeploy.
+        project_networks = [n for n in networks if n not in _DOCKER_BUILTIN_NETWORKS]
+
+        # Labels and environment that describe the *old image* must not follow
+        # the container onto the new one. Docker merges image labels under
+        # container labels and bakes image ENV into ``Config.Env``, so copying
+        # both verbatim would make a 1.4.2 container claim to be 1.4.1.
+        labels = {
+            key: value
+            for key, value in dict(getattr(template, "labels", {}) or {}).items()
+            if not key.startswith(_IMAGE_OWNED_LABEL_PREFIXES)
+        }
         labels[AEGIS_MANAGED_LABEL] = "true"
-        container = client.containers.run(
+        environment = self._container_only_env(client, config)
+
+        # The name must be unique per replacement, not per index: the old
+        # container is still running when the new one is created, and a second
+        # redeploy of the same service would otherwise collide with the first.
+        version = image.rsplit(":", 1)[-1].replace(".", "-")
+        name = f"{self._project}-{service}-v{version}-{index + 1}-{uuid.uuid4().hex[:6]}"
+        container = client.containers.create(
             image,
             detach=True,
-            name=f"{self._project}-{service}-rollback-{index + 1}",
-            environment=list(config.get("Env") or []),
+            name=name,
+            environment=environment,
             labels=labels,
-            network=attached[0] if attached else None,
             restart_policy={"Name": "unless-stopped"},
         )
+        try:
+            # Joined with the service name as a DNS alias, as Compose does.
+            # Without it, callers resolving ``checkout`` lose the service the
+            # moment the original container is removed. Only the service name:
+            # the template's other aliases are its own id and container name.
+            for network_name in project_networks:
+                client.networks.get(network_name).connect(container, aliases=[service])
+            if project_networks and "bridge" not in project_networks:
+                # ``create`` attached the default bridge; the original was not on
+                # it, so neither is the replacement.
+                with contextlib.suppress(Exception):
+                    client.networks.get("bridge").disconnect(container)
+            container.start()
+        except Exception:
+            # A replacement that never started must not linger as a "created"
+            # container that later reads as a running version of the service.
+            with contextlib.suppress(Exception):
+                container.remove(force=True)
+            raise
         return str(getattr(container, "id", ""))[:12]
+
+    @staticmethod
+    def _container_only_env(client: Any, config: dict[str, Any]) -> list[str]:
+        """The template's environment minus what its image baked in.
+
+        When the old image cannot be inspected the full environment is kept:
+        dropping configuration a service needs is worse than carrying a stale
+        version string, which the new image's labels still contradict.
+        """
+        env = [str(item) for item in (config.get("Env") or [])]
+        try:
+            image_attrs = client.images.get(str(config.get("Image", ""))).attrs or {}
+        except Exception:  # noqa: BLE001 - inspection is an optimisation here
+            return env
+        baked = set(_as_dict(image_attrs.get("Config")).get("Env") or [])
+        return [item for item in env if item not in baked]
 
 
 # --------------------------------------------------------------------------- #

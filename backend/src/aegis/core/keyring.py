@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from aegis.core.clock import SYSTEM_CLOCK, Clock
 from aegis.core.config import Settings
@@ -80,6 +80,15 @@ def _status_of(exc: BaseException) -> int | None:
         if isinstance(status, int):
             return status
     return None
+
+
+def http_status(exc: BaseException) -> int | None:
+    """Public form of ``_status_of`` for callers outside the ring.
+
+    The brain tiers need the raw status (a 403 on a Bedrock model id means
+    "not enabled for this account", which is not a key decision at all).
+    """
+    return _status_of(exc)
 
 
 def classify(exc: BaseException) -> KeyFault:
@@ -138,7 +147,7 @@ class KeyRing:
     slot so that one exhausted key cannot trip the whole provider.
     """
 
-    __slots__ = ("_keys", "_purpose", "_clock", "_state")
+    __slots__ = ("_keys", "_purpose", "_pool", "_clock", "_state")
 
     def __init__(
         self,
@@ -146,9 +155,17 @@ class KeyRing:
         *,
         purpose: str,
         clock: Clock = SYSTEM_CLOCK,
+        pool: Literal["compactor", "brain"] | None = None,
     ) -> None:
-        self._keys = settings.google_api_keys
+        # ``pool=None`` is the original four-key ring every existing caller
+        # uses. A named pool draws only the slots that pool owns, so a Bedrock
+        # outage that pushes the brain onto Gemini burns the brain's quota and
+        # never the compactor's.
+        self._keys = (
+            settings.google_api_keys if pool is None else settings.gemini_pool_keys(pool)
+        )
         self._purpose = purpose
+        self._pool = pool
         self._clock = clock
         self._state: dict[int, _SlotState] = {
             i: _SlotState() for i in range(len(self._keys))
@@ -166,14 +183,25 @@ class KeyRing:
     def size(self) -> int:
         return len(self._keys)
 
+    @property
+    def pool(self) -> str | None:
+        return self._pool
+
     def _slot(self, index: int) -> KeySlot:
         label = f"key{index + 1}"
+        # One breaker per key. A shared breaker would let a single exhausted
+        # free-tier key open the circuit for three healthy ones. The pool name
+        # is part of the breaker name so "key1" of the brain pool and "key1" of
+        # the compactor pool - different credentials - never share a circuit.
+        dependency = (
+            f"{self._purpose}:google:{label}"
+            if self._pool is None
+            else f"{self._purpose}:google:{self._pool}:{label}"
+        )
         return KeySlot(
             index=index,
             label=label,
-            # One breaker per key. A shared breaker would let a single
-            # exhausted free-tier key open the circuit for three healthy ones.
-            dependency=f"{self._purpose}:google:{label}",
+            dependency=dependency,
             secret=self._keys[index],
         )
 
@@ -254,4 +282,4 @@ class KeyRing:
         return sum(1 for s in self._state.values() if s.parked_until <= now)
 
 
-__all__ = ["KeyFault", "KeyRing", "KeySlot", "classify"]
+__all__ = ["KeyFault", "KeyRing", "KeySlot", "classify", "http_status"]

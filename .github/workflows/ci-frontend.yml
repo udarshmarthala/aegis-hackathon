@@ -3,10 +3,10 @@
 name: ci-frontend
 
 on:
+  # No path filter on pull requests: the job name is a required status check,
+  # and a required check whose workflow never starts leaves a PR that touches
+  # only other paths waiting forever.
   pull_request:
-    paths:
-      - "frontend/**"
-      - ".github/workflows/ci-frontend.yml"
   push:
     branches: [main]
     paths:

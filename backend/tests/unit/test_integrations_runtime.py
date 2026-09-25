@@ -100,6 +100,9 @@ class FakeContainer:
     def remove(self, force: bool = False) -> None:
         self.calls.append(("remove", force))
 
+    def start(self) -> None:
+        self.calls.append(("start",))
+
     def logs(self, **kwargs) -> bytes:
         self.calls.append(("logs", kwargs))
         return b"starting up\nuser 7 not found\nready\n"
@@ -112,6 +115,9 @@ class FakeNetwork:
 
     def disconnect(self, container) -> None:
         self._log.append((self.name, container.id))
+
+    def connect(self, container, aliases=None) -> None:
+        self._log.append((self.name, container.id, "connect", tuple(aliases or ())))
 
 
 class FakeDocker:
@@ -142,7 +148,7 @@ class FakeDocker:
                         return container
                 raise KeyError(ident)
 
-            def run(self, image, **kwargs):
+            def create(self, image, **kwargs):
                 outer.created.append({"image": image, **kwargs})
                 created = FakeContainer(
                     f"new{len(outer.created)}00000000000",
@@ -152,6 +158,8 @@ class FakeDocker:
                 created.labels.update(kwargs["labels"])
                 outer._containers.append(created)
                 return created
+
+            run = create
 
         class _Networks:
             def get(self, name):
@@ -418,6 +426,24 @@ async def test_rollback_starts_the_replacement_before_stopping_the_old_one():
     assert ("stop", 30) in old.calls
     assert result.no_op is False
     assert "1.4.1" in result.performed
+    new = adapter._client._containers[-1]
+    assert ("start",) in new.calls
+
+
+async def test_rollback_keeps_the_service_dns_name_and_a_unique_container_name():
+    # Callers reach the service by its Compose name; a replacement that does not
+    # answer to it is an outage. And two redeploys of one service must not
+    # collide on the replacement's container name.
+    old = FakeContainer("aaaaaaaaaaaa11", "checkout", image="aegis/workload:1.4.2")
+    adapter = compose([old])
+    await adapter.rollback_deployment("checkout", "1.4.1", idempotency_key="act_20")
+    await adapter.rollback_deployment("checkout", "1.4.2", idempotency_key="act_21")
+
+    docker = adapter._client
+    connects = [entry for entry in docker.disconnects if len(entry) == 4]
+    assert connects and all(entry[3] == ("checkout",) for entry in connects)
+    names = [created["name"] for created in docker.created]
+    assert len(names) == 2 and len(set(names)) == 2
 
 
 async def test_rollback_to_the_running_version_is_a_no_op():
@@ -444,3 +470,42 @@ async def test_close_releases_the_docker_client():
     docker = adapter._client
     await adapter.close()
     assert docker.closed is True
+
+
+async def test_rollback_does_not_carry_the_old_images_identity():
+    # Image-owned labels and baked-in ENV describe the old build. Copied onto the
+    # replacement they would make a 1.4.1 container report itself as 1.4.2.
+    old = FakeContainer("aaaaaaaaaaaa11", "checkout", image="aegis/workload:1.4.2")
+    old.labels["aegis.version"] = "1.4.2"
+    old.labels["aegis.dependency.version"] = "1.0.9"
+    adapter = compose([old])
+    await adapter.rollback_deployment("checkout", "1.4.1", idempotency_key="act_30")
+
+    created = adapter._client.created[0]
+    assert "aegis.version" not in created["labels"]
+    assert "aegis.dependency.version" not in created["labels"]
+    assert created["labels"][COMPOSE_SERVICE_LABEL] == "checkout"
+
+
+async def test_a_replacement_that_fails_to_start_is_removed_and_the_old_one_kept():
+    old = FakeContainer("aaaaaaaaaaaa11", "checkout", image="aegis/workload:1.4.2")
+    adapter = compose([old])
+    docker = adapter._client
+    original_create = docker.containers.create
+
+    def failing_create(image, **kwargs):
+        created = original_create(image, **kwargs)
+
+        def boom() -> None:
+            raise RuntimeError("port already allocated")
+
+        created.start = boom
+        return created
+
+    docker.containers.create = failing_create
+    with pytest.raises(Exception):  # noqa: B017 - any failure must propagate
+        await adapter.rollback_deployment("checkout", "1.4.1", idempotency_key="act_31")
+
+    replacement = docker._containers[-1]
+    assert ("remove", True) in replacement.calls
+    assert ("stop", 30) not in old.calls

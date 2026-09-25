@@ -409,7 +409,9 @@ class ExecutionService:
                 )
             elif verification.verdict.requires_rollback:
                 rolled_back, rollback_outcome, escalated, escalation_reason = (
-                    await self._rollback(validated, ports, outcome, verification)
+                    await self._rollback(
+                        validated, ports, outcome, verification, attempt_id=attempt_id
+                    )
                 )
                 final_state = (
                     ActionState.ROLLED_BACK if rolled_back else ActionState.FAILED
@@ -501,8 +503,14 @@ class ExecutionService:
 
     # ---- helpers ---------------------------------------------------------- #
 
-    async def _start_deployment(self, validated: ValidatedAction) -> str | None:
+    async def _start_deployment(
+        self, validated: ValidatedAction, *, compensates: str | None = None
+    ) -> str | None:
         """Open a deployment attempt for actions that change what is running.
+
+        ``compensates`` marks the automatic undo of a change that failed
+        verification. That undo moves the service between versions too, and a
+        history missing it would name the reverted version as what is live.
 
         Returns ``None`` when there is nothing to record or the row could not be
         written. Bookkeeping never blocks a gated write: an attempt row that was
@@ -521,12 +529,17 @@ class ExecutionService:
                 service_id=service_id,
                 incident_id=validated.action.incident_id,
                 action_id=validated.action.id,
-                strategy=DEPLOYMENT_STRATEGIES.get(validated.action_type, "rolling"),
+                strategy=(
+                    "compensating_rollback"
+                    if compensates
+                    else DEPLOYMENT_STRATEGIES.get(validated.action_type, "rolling")
+                ),
                 state=DeploymentState.IN_PROGRESS,
                 detail={
                     "action_type": validated.action_type.value,
                     "autonomous": not validated.was_human_approved,
                     "correlation_id": validated.correlation_id,
+                    **({"compensates": compensates} if compensates else {}),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - never block an authorised write
@@ -547,6 +560,8 @@ class ExecutionService:
         outcome: ExecutionOutcome | None = None,
         verification_id: str | None = None,
         error: str | None = None,
+        from_version: str | None = None,
+        to_version: str | None = None,
     ) -> None:
         """Close an attempt with what was observed, never with what was asked for.
 
@@ -567,8 +582,8 @@ class ExecutionService:
                 state=state,
                 verification_id=verification_id,
                 error=error,
-                from_version=_version(detail.get("from_version")),
-                to_version=_version(detail.get("to_version")),
+                from_version=from_version or _version(detail.get("from_version")),
+                to_version=to_version or _version(detail.get("to_version")),
                 detail={
                     **detail,
                     "performed": outcome.performed if outcome else None,
@@ -598,6 +613,8 @@ class ExecutionService:
         ports: ExecutionPorts,
         outcome: ExecutionOutcome | None,
         verification: VerificationRun,
+        *,
+        attempt_id: str | None = None,
     ) -> tuple[bool, ExecutionOutcome | None, bool, str]:
         """Undo a change that failed verification.
 
@@ -618,10 +635,28 @@ class ExecutionService:
         if outcome is None:
             return False, None, True, "nothing was executed, so nothing was rolled back"
 
+        # The undo is itself a deployment: it returns the service to the
+        # version the executor observed before the change. Versions are the
+        # original outcome's, reversed - both were observed, neither requested.
+        undo_from = _version(outcome.detail.get("to_version"))
+        undo_to = _version(outcome.detail.get("from_version"))
+        compensation_id = (
+            await self._start_deployment(validated, compensates=attempt_id)
+            if attempt_id is not None
+            else None
+        )
+
         try:
             executor = executor_for(validated.action_type)
             rollback_outcome = await executor.rollback(validated, ports, outcome)
         except AegisError as exc:
+            await self._finish_deployment(
+                compensation_id,
+                DeploymentState.FAILED,
+                error=f"rollback failed: {exc}",
+                from_version=undo_from,
+                to_version=undo_to,
+            )
             await self._actions.transition(
                 action_id,
                 to=ActionState.FAILED,
@@ -655,6 +690,14 @@ class ExecutionService:
             )
 
         if not rollback_outcome.ok:
+            await self._finish_deployment(
+                compensation_id,
+                DeploymentState.FAILED,
+                outcome=rollback_outcome,
+                error=rollback_outcome.error or "rollback reported failure",
+                from_version=undo_from,
+                to_version=undo_to,
+            )
             await self._actions.transition(
                 action_id,
                 to=ActionState.FAILED,
@@ -711,6 +754,14 @@ class ExecutionService:
                 "verdict": verification.verdict.value,
             },
             correlation_id=validated.correlation_id,
+        )
+        # DEPLOYED, not VERIFIED: nothing measured the service after the undo.
+        await self._finish_deployment(
+            compensation_id,
+            DeploymentState.DEPLOYED,
+            outcome=rollback_outcome,
+            from_version=undo_from,
+            to_version=undo_to,
         )
         log.info("rolled back", action_id=action_id, incident_id=incident_id)
         regression = verification.verdict is VerificationVerdict.REGRESSION_DETECTED

@@ -355,7 +355,14 @@ class ActionGate:
         report = await self._gate_evidence(proposal)
 
         stored, created = await self._actions.propose(proposal)
-        if not created and stored.state is not ActionState.PROPOSED:
+        # An action parked for a human is re-gated in full when the decision
+        # arrives - that is the whole point of "approval authorises, it does not
+        # bypass". Without this, re-validating an approved action collided with
+        # its own idempotency key and was refused as already in progress, so no
+        # approved action could ever execute. Once a human has been asked, only
+        # a human can release it (see ``awaiting_human`` below).
+        awaiting_human = not created and stored.state is ActionState.HUMAN_REQUIRED
+        if not created and stored.state is not ActionState.PROPOSED and not awaiting_human:
             # An identical proposal already progressed. Returning its current
             # decision keeps a retried workflow idempotent instead of racing.
             log.info(
@@ -446,7 +453,11 @@ class ActionGate:
 
         # ---- gate 4: authorisation --------------------------------------- #
         approval: ApprovalRequest | None = None
-        if decision.effect is PolicyEffect.REQUIRE_HUMAN:
+        # ``awaiting_human``: policy may have relaxed since the request was
+        # opened, but an operator is already looking at this exact action. A
+        # silent autonomous run underneath their open approval would be worse
+        # than waiting for them.
+        if decision.effect is PolicyEffect.REQUIRE_HUMAN or awaiting_human:
             granted = await self._approvals.granted_for_action(stored.id)
             now = self._clock.now()
             if granted is not None and granted.is_usable(now):

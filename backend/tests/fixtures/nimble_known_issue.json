@@ -1,0 +1,19 @@
+{
+  "component": "httpcore",
+  "version": "1.0.9",
+  "query": "httpcore 1.0.9 connections remain active in pool after cancel github issue",
+  "captured_via": "nimble",
+  "captured_at": "2026-09-25T20:49:25+00:00",
+  "tools_allowlisted": [
+    "nimble_extract",
+    "nimble_search"
+  ],
+  "issues": [
+    {
+      "title": "Potential Issue: `AsyncClient.stream` double-cancel may leak active connections \u00b7 Issue #3782 \u00b7 encode/httpx",
+      "url": "https://github.com/encode/httpx/issues/3782",
+      "excerpt": "Reported against httpx 0.28.1 with httpcore 1.0.9: when a task consuming an AsyncClient.stream() response is cancelled twice in quick succession, the httpcore connection pool keeps that connection counted as active after the task has ended. Each repetition strands another slot, so the pool drains gradually until max_connections is reached and new requests wait on the pool indefinitely. Reporter: connections \"appear to remain 'active' in the underlying pool after the task finishes\". The issue links a related httpcore pull request (#1113).",
+      "nimble_rank": 1
+    }
+  ]
+}

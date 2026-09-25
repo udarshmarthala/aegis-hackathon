@@ -252,7 +252,9 @@ class Settings(BaseSettings):
     # --- Nimble (external evidence) ---
     nimble_api_key: SecretStr = SecretStr("")
     nimble_mcp_url: str = "https://mcp.nimbleway.com/mcp"
-    nimble_timeout_s: float = Field(default=8.0, gt=0)
+    # Measured live: MCP handshake ~3 s plus search ~5 s, and an extract adds
+    # ~4 s. An 8 s bound would make the fixture the answer almost every time.
+    nimble_timeout_s: float = Field(default=20.0, gt=0)
 
     # --- Black Forest Labs (incident map) ---
     bfl_api_key: SecretStr = SecretStr("")

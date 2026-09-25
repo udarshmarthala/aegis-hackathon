@@ -37,6 +37,19 @@ than hidden:
   healthy.
 * `disk_pressure` fills a bounded file under a cap rather than a real volume.
 
+## Faults that ship in the image
+
+`pool_leak` is gradual: every `leak_interval_s` it permanently takes
+`leak_per_interval` slots of the real connection pool, so utilisation, queueing,
+p99 and finally the error rate climb over a minute or two instead of stepping.
+A leaked slot is released only by clearing the fault or by the process exiting.
+
+`BAKED_FAULT` applies a mode at boot, but only when `WORKLOAD_VERSION` is listed
+in `BAKED_FAULT_VERSIONS`. The fault then belongs to the image version rather
+than to a runtime toggle, which is what makes the remedies behave as they would
+in production: a restart re-applies it (and only buys time), a rollback to a
+version without it removes it.
+
 ## Bounds
 
 Every fault is bounded, because a benchmark that can exhaust the host is a
@@ -88,7 +101,47 @@ DOWNSTREAM: Final = tuple(
     d.strip() for d in os.getenv("DOWNSTREAM", "").split(",") if d.strip()
 )
 PORT: Final = int(os.getenv("PORT", "8080"))
-VERSION_ENV: Final = os.getenv("SERVICE_VERSION", "1.0.0")
+
+
+def _build_info() -> dict[str, str]:
+    """The identity written into the image at build time, if there is one.
+
+    A file rather than only ENV because the runtime adapter recreates a
+    container on another tag by copying the old container's environment, and
+    that copy carries the *old* image's WORKLOAD_VERSION and BAKED_FAULT. A
+    file inside the image cannot be overridden that way, so a 1.4.2 container
+    is a 1.4.2 container however it was started.
+    """
+    path = Path(os.getenv("WORKLOAD_BUILD_INFO", "/app/build-info.json"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+_BUILD_INFO: Final = _build_info()
+
+
+def _identity(key: str, env: str, default: str = "") -> str:
+    return _BUILD_INFO.get(key) or os.getenv(env, default)
+
+
+# The image's own version wins; SERVICE_VERSION is the older per-container
+# override for runs outside a built image.
+VERSION_ENV: Final = _identity(
+    "version", "WORKLOAD_VERSION", os.getenv("SERVICE_VERSION", "1.0.0")
+)
+DEPENDENCY_NAME: Final = _identity("dependency", "DEPENDENCY_NAME")
+DEPENDENCY_VERSION: Final = _identity("dependency_version", "DEPENDENCY_VERSION")
+BAKED_FAULT: Final = (
+    _BUILD_INFO["baked_fault"] if "baked_fault" in _BUILD_INFO else os.getenv("BAKED_FAULT", "")
+).strip()
+BAKED_FAULT_VERSIONS: Final = frozenset(
+    v.strip()
+    for v in _identity("baked_fault_versions", "BAKED_FAULT_VERSIONS").split(",")
+    if v.strip()
+)
 
 _KIND_DEFAULTS: Final[dict[str, dict[str, int]]] = {
     "service": {"pool": 32, "workers": 16, "cache": 256, "floor_ms": 3},
@@ -110,6 +163,15 @@ MAX_DISK_BYTES: Final = 128 * 1024 * 1024
 MAX_CPU_BURN_MS: Final = 250
 MAX_SLEEP_MS: Final = 30_000
 POOL_WAIT_BUDGET_S: Final = 2.0
+# pool_leak pacing. The interval floor stops a mistyped parameter turning a
+# gradual leak into an instant exhaustion, which is a different incident.
+LEAK_INTERVAL_DEFAULT_S: Final = 3.0
+LEAK_INTERVAL_MIN_S: Final = 0.01
+LEAK_PER_INTERVAL_DEFAULT: Final = 1
+LEAK_PER_INTERVAL_MAX: Final = 8
+# How long a request holds its connection while pool_leak is active. Requests
+# must really use the pool, or leaked slots would starve nobody.
+LEAK_QUERY_MS_DEFAULT: Final = 20
 # A name reserved by RFC 6761 precisely so it never resolves. Using it means the
 # DNS failure is a real resolver error rather than a raised exception pretending
 # to be one.
@@ -134,6 +196,7 @@ MODES: Final[frozenset[str]] = frozenset(
         "bad_deploy",
         "clock_skew",
         "thread_starvation",
+        "pool_leak",
     }
 )
 
@@ -170,7 +233,11 @@ DEP_ERRORS = Counter(
 )
 LEAKED = Gauge("workload_leaked_bytes", "Bytes deliberately retained", ["service"])
 DISK_USED = Gauge("workload_disk_used_bytes", "Bytes deliberately written", ["service"])
-BUILD = Gauge("workload_build_info", "Deployed build, 1 per version", ["service", "version"])
+BUILD = Gauge(
+    "workload_build_info",
+    "Deployed build, 1 per version",
+    ["service", "version", "dependency", "dependency_version"],
+)
 STARTED_AT = Gauge("workload_start_time_seconds", "Process start, unix seconds", ["service"])
 FAULT_ACTIVE = Gauge(
     "workload_fault_active", "1 while a fault is injected", ["service", "mode"]
@@ -226,6 +293,8 @@ class Runtime:
         "version",
         "clock_offset_s",
         "downstream_timeout_s",
+        "leaked_slots",
+        "leak_task",
     )
 
     def __init__(self) -> None:
@@ -239,10 +308,27 @@ class Runtime:
         self.version = VERSION_ENV
         self.clock_offset_s = 0.0
         self.downstream_timeout_s = 5.0
+        self.leaked_slots = 0
+        self.leak_task: asyncio.Task[None] | None = None
+
+    def release_leak(self) -> None:
+        """Stop the leaker and hand every leaked slot back to the pool.
+
+        The task is cancelled before the slots are released so it cannot take
+        one back between the two steps.
+        """
+        if self.leak_task is not None:
+            self.leak_task.cancel()
+            self.leak_task = None
+        for _ in range(self.leaked_slots):
+            self.pool.release()
+            POOL_IN_USE.labels(SERVICE).dec()
+        self.leaked_slots = 0
 
     def reset(self) -> None:
         """Return to a healthy baseline and release everything a fault held."""
         self.fault = FaultState()
+        self.release_leak()
         self.leak.clear()
         LEAKED.labels(SERVICE).set(0)
         if self.disk_path is not None:
@@ -268,7 +354,7 @@ def _publish_fault(mode: str) -> None:
 
 def _publish_build(version: str) -> None:
     BUILD.clear()
-    BUILD.labels(SERVICE, version).set(1)
+    BUILD.labels(SERVICE, version, DEPENDENCY_NAME, DEPENDENCY_VERSION).set(1)
 
 
 rt = Runtime()
@@ -340,6 +426,56 @@ def _fill_disk(byte_count: int) -> None:
         return
     rt.disk_bytes += chunk
     DISK_USED.labels(SERVICE).set(rt.disk_bytes)
+
+
+async def leak_pool_step(count: int) -> int:
+    """Permanently take up to ``count`` connection-pool slots. Returns how many.
+
+    Bounded by the pool itself: once every slot is leaked there is nothing left
+    to take. A slot busy with a request is waited for (up to the normal pool
+    budget) as a leaking driver would, rather than skipped, so the leak keeps
+    pace under load instead of stalling while the pool is busy.
+    """
+    taken = 0
+    for _ in range(max(0, count)):
+        if rt.leaked_slots >= POOL_SIZE:
+            break
+        try:
+            await asyncio.wait_for(rt.pool.acquire(), timeout=POOL_WAIT_BUDGET_S)
+        except TimeoutError:
+            break
+        # No await between the acquire and the bookkeeping, so a cancellation
+        # cannot leave a slot held that release_leak does not know about.
+        rt.leaked_slots += 1
+        POOL_IN_USE.labels(SERVICE).inc()
+        taken += 1
+    return taken
+
+
+async def _leak_pool_loop(interval_s: float, per_interval: int) -> None:
+    while rt.leaked_slots < POOL_SIZE:
+        await asyncio.sleep(interval_s)
+        await leak_pool_step(per_interval)
+
+
+def _start_pool_leak() -> None:
+    interval = max(
+        LEAK_INTERVAL_MIN_S, float(_param("leak_interval_s", LEAK_INTERVAL_DEFAULT_S))
+    )
+    per = min(
+        LEAK_PER_INTERVAL_MAX,
+        max(1, int(_param("leak_per_interval", LEAK_PER_INTERVAL_DEFAULT))),
+    )
+    rt.leak_task = asyncio.create_task(_leak_pool_loop(interval, per))
+
+
+def baked_fault_applies(version: str, fault: str, versions: frozenset[str]) -> bool:
+    """Whether the image's baked fault is live for this version.
+
+    Keyed on the version so one Dockerfile builds both the healthy and the
+    faulty tag: the faulty build lists itself, the healthy one does not.
+    """
+    return bool(fault) and fault != "none" and version in versions
 
 
 async def _hold_pool(name: str, sem: asyncio.Semaphore, hold_ms: int) -> str | None:
@@ -416,6 +552,13 @@ async def apply_fault() -> str | None:
 
     if mode == "pool_exhaustion":
         return await _hold_pool("connection", rt.pool, magnitude or 500)
+
+    if mode == "pool_leak":
+        # Every request needs a connection. The leak is the background task;
+        # what the caller experiences is a pool that keeps getting smaller.
+        return await _hold_pool(
+            "connection", rt.pool, int(_param("query_ms", LEAK_QUERY_MS_DEFAULT))
+        )
 
     if mode == "db_saturation":
         return await _hold_pool("db", rt.pool, magnitude or 800)
@@ -515,7 +658,12 @@ async def _call_downstream(client: httpx.AsyncClient, target: str) -> tuple[str,
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.client = httpx.AsyncClient(timeout=rt.downstream_timeout_s)
+    if baked_fault_applies(VERSION_ENV, BAKED_FAULT, BAKED_FAULT_VERSIONS):
+        # Applied on every boot, so a restart resets the damage and then the
+        # same image starts doing it again.
+        apply_fault_state(FaultState(mode=BAKED_FAULT).normalised())
     yield
+    rt.release_leak()
     await app.state.client.aclose()
 
 
@@ -583,6 +731,8 @@ async def health() -> dict[str, Any]:
         "version": rt.version,
         "fault": rt.fault.mode,
         "downstream": list(DOWNSTREAM),
+        "dependency": DEPENDENCY_NAME,
+        "dependency_version": DEPENDENCY_VERSION,
     }
 
 
@@ -611,11 +761,19 @@ async def set_fault(state: FaultState) -> Any:
             media_type="application/json",
         )
 
+    apply_fault_state(normalised)
+    return {"applied": rt.fault.model_dump(), "service": SERVICE, "version": rt.version}
+
+
+def apply_fault_state(normalised: FaultState) -> None:
+    """Replace the active fault. Shared by the admin endpoint and by boot."""
     rt.reset()
     rt.fault = normalised
     _publish_fault(normalised.mode)
 
-    if normalised.mode == "cache_flush":
+    if normalised.mode == "pool_leak":
+        _start_pool_leak()
+    elif normalised.mode == "cache_flush":
         # The point of the scenario: everything that was warm is now cold, and
         # latency stays high until the working set is rebuilt.
         rt.cache.clear()
@@ -629,8 +787,6 @@ async def set_fault(state: FaultState) -> Any:
         _publish_build(rt.version)
     elif normalised.mode == "clock_skew":
         rt.clock_offset_s = float(_param("offset_s", 300.0))
-
-    return {"applied": rt.fault.model_dump(), "service": SERVICE, "version": rt.version}
 
 
 @app.delete("/admin/fault")
@@ -652,6 +808,7 @@ async def admin_state() -> dict[str, Any]:
         "version": rt.version,
         "fault": rt.fault.model_dump(),
         "leaked_bytes": sum(len(b) for b in rt.leak),
+        "leaked_pool_slots": rt.leaked_slots,
         "disk_bytes": rt.disk_bytes,
         "cache_entries": len(rt.cache),
         "pool_size": POOL_SIZE,

@@ -1,6 +1,6 @@
 import {
   Activity, AlertCircle, BarChart3, Boxes, Bug, CheckSquare, FileSearch,
-  GitBranch, Network, ScrollText, Settings, ShieldCheck, Siren, Workflow,
+  GitBranch, MonitorPlay, Network, ScrollText, Settings, ShieldCheck, Siren, Workflow,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -27,6 +27,7 @@ export type NavHref =
   | '/incidents'
   | '/systems'
   | '/tasks'
+  | '/war-room'
   | '/graph'
   | '/reliability'
   | '/recurring'
@@ -64,6 +65,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
       { href: '/incidents', label: 'Incidents', icon: Siren },
       { href: '/systems', label: 'Live Systems', icon: Boxes, keywords: 'services topology' },
       { href: '/tasks', label: 'My Tasks', icon: CheckSquare },
+      { href: '/war-room', label: 'War Room', icon: MonitorPlay, keywords: 'demo projector live run horizon' },
     ],
   },
   {

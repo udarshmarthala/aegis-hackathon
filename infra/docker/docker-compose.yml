@@ -71,6 +71,31 @@ x-common-env: &common-env
 x-restart: &restart
   restart: unless-stopped
 
+# What the api and worker need to act on the workload and to reach Bedrock.
+#
+# The Docker socket is how the Compose runtime adapter restarts and rolls back
+# workload containers; without it every write reports the adapter unavailable.
+# It is root-equivalent on the host, which is why it is mounted only into the
+# two processes whose writes already pass the full gate chain, and never into
+# the workload or the web tier. On Docker Desktop the socket is root:root 0660,
+# hence the extra group for the non-root aegis user.
+#
+# AWS credentials come from the host's own profile, read-only, so no key is
+# ever copied into .env or an image. /home/aegis is the backend image's user.
+x-aegis-runtime: &aegis-runtime
+  group_add: ["0"]
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ${AWS_CONFIG_DIR:-~/.aws}:/home/aegis/.aws:ro
+
+x-aegis-runtime-env: &aegis-runtime-env
+  SANDBOX_DOCKER_HOST: unix:///var/run/docker.sock
+  COMPOSE_PROJECT_NAME: aegis-2-0
+  AWS_PROFILE: ${AWS_PROFILE:-}
+  AWS_REGION: ${AWS_REGION:-us-west-2}
+  AWS_CONFIG_FILE: /home/aegis/.aws/config
+  AWS_SHARED_CREDENTIALS_FILE: /home/aegis/.aws/credentials
+
 services:
   # ------------------------------------------------------------ datastores --
   postgres:
@@ -154,7 +179,7 @@ services:
       context: ../../backend
       dockerfile: Dockerfile
     image: aegis-2.0-backend:latest
-    <<: *restart
+    <<: [*restart, *aegis-runtime]
     # A hand-curated environment list silently drops every setting nobody
     # remembered to add - which is how GITHUB_TOKEN and LLM_REQUEST_TIMEOUT_S sat
     # correctly configured in .env while the containers ran without them. Each
@@ -164,7 +189,7 @@ services:
     env_file:
       - ../../.env
     environment:
-      <<: *common-env
+      <<: [*common-env, *aegis-runtime-env]
       OTEL_SERVICE_NAME: aegis-api
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     secrets:
@@ -192,7 +217,7 @@ services:
       context: ../../backend
       dockerfile: Dockerfile
     image: aegis-2.0-backend:latest
-    <<: *restart
+    <<: [*restart, *aegis-runtime]
     command: ["python", "-m", "aegis.worker.main", "--concurrency", "${WORKER_CONCURRENCY:-2}"]
     # A hand-curated environment list silently drops every setting nobody
     # remembered to add - which is how GITHUB_TOKEN and LLM_REQUEST_TIMEOUT_S sat
@@ -203,7 +228,7 @@ services:
     env_file:
       - ../../.env
     environment:
-      <<: *common-env
+      <<: [*common-env, *aegis-runtime-env]
       OTEL_SERVICE_NAME: aegis-worker
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
     secrets:
@@ -218,6 +243,9 @@ services:
     healthcheck:
       disable: true
     # SIGTERM drains in-flight investigations; give the worker room to finish.
+    # A crash (the war room's kill switch hard-exits with 137) is brought back
+    # by `restart: unless-stopped` above, and the orchestrator resumes from its
+    # last checkpoint.
     stop_grace_period: 45s
     deploy:
       resources:
@@ -309,8 +337,18 @@ services:
   # benchmark cannot hand the agent privileged knowledge of the fault
   # (ESD section 16).
   gateway:
-    build: { context: ../../workload }
-    image: aegis-2.0-workload:latest
+    build: &workload-build
+      context: ../../workload
+      # Tagged versions rather than :latest, so a rollback has a real, older
+      # image to return to. `make workload-images` builds both demo tags; these
+      # defaults reproduce the healthy 1.4.1 build exactly (a cache hit), so
+      # `up --build` never replaces it with an unlabelled image. Build 1.4.2
+      # with the Makefile, not by setting WORKLOAD_TAG here.
+      args:
+        WORKLOAD_VERSION: ${WORKLOAD_TAG:-1.4.1}
+        DEPENDENCY_NAME: ${WORKLOAD_DEPENDENCY_NAME:-httpcore}
+        DEPENDENCY_VERSION: ${WORKLOAD_DEPENDENCY_VERSION:-1.0.7}
+    image: aegis-2.0-workload:${WORKLOAD_TAG:-1.4.1}
     <<: *restart
     profiles: ["workload"]
     environment:
@@ -328,8 +366,8 @@ services:
       - "18001:8080"
 
   checkout:
-    build: { context: ../../workload }
-    image: aegis-2.0-workload:latest
+    build: *workload-build
+    image: aegis-2.0-workload:${WORKLOAD_TAG:-1.4.1}
     <<: *restart
     profiles: ["workload"]
     environment:
@@ -346,8 +384,8 @@ services:
       - "18000:8080"
 
   payment:
-    build: { context: ../../workload }
-    image: aegis-2.0-workload:latest
+    build: *workload-build
+    image: aegis-2.0-workload:${WORKLOAD_TAG:-1.4.1}
     <<: *restart
     profiles: ["workload"]
     environment:

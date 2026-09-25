@@ -444,3 +444,65 @@ async def test_no_key_material_reaches_the_failure_report() -> None:
     rendered = f"{exc.value.message} {exc.value.context}"
     for key in (KEY1, KEY2, KEY3, KEY4):
         assert key not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# named pools                                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def eight_keys(**over: Any) -> Settings:
+    slots = {
+        "google_api_key": KEY1,
+        "google_api_key_2": KEY2,
+        "google_api_key_3": KEY3,
+        "google_api_key_4": KEY4,
+        "google_api_key_5": "AIzaTESTKEY-5",
+        "google_api_key_6": "AIzaTESTKEY-6",
+        "google_api_key_7": "AIzaTESTKEY-7",
+        "google_api_key_8": "AIzaTESTKEY-8",
+        "gemini_compactor_keys": "1,2,3,4,5",
+        "gemini_brain_keys": "6,7,8",
+    }
+    slots.update(over)
+    return settings(**slots)
+
+
+def test_default_ring_is_unchanged_by_pools() -> None:
+    """``pool=None`` is still the original four-key ring and breaker names."""
+    ring = KeyRing(eight_keys(), purpose="llm")
+    assert ring.size == 4
+    assert [s.dependency for s in ring.slots()][0] == "llm:google:key1"
+
+
+def test_named_pools_draw_only_their_own_slots() -> None:
+    s = eight_keys()
+    brain = KeyRing(s, purpose="brain", pool="brain")
+    compactor = KeyRing(s, purpose="compactor", pool="compactor")
+    assert [slot.secret for slot in brain.slots()] == [
+        "AIzaTESTKEY-6", "AIzaTESTKEY-7", "AIzaTESTKEY-8",
+    ]
+    assert compactor.size == 5
+    assert brain.slots()[0].dependency == "brain:google:brain:key1"
+    # Labels never carry the secret.
+    assert all("AIza" not in slot.label for slot in brain.slots())
+
+
+def test_parking_a_brain_key_never_touches_the_compactor_pool() -> None:
+    """A Bedrock outage moves load onto the brain pool; compaction must not
+    lose quota because of it."""
+    clock = FrozenClock()
+    s = eight_keys()
+    brain = KeyRing(s, purpose="brain", clock=clock, pool="brain")
+    compactor = KeyRing(s, purpose="compactor", clock=clock, pool="compactor")
+    for slot in brain.slots():
+        brain.park(slot, KeyFault.QUOTA)
+    assert brain.ready_count == 0
+    assert compactor.ready_count == 5
+    assert {e["state"] for e in compactor.status()} == {"ready"}
+
+
+def test_an_empty_pool_is_unconfigured() -> None:
+    s = eight_keys(google_api_key_6="", google_api_key_7="", google_api_key_8="")
+    assert KeyRing(s, purpose="brain", pool="brain").configured is False
+    assert KeyRing(s, purpose="compactor", pool="compactor").configured is True

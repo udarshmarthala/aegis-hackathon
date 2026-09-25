@@ -146,6 +146,21 @@ async def decide(
             payload={"action_id": approval.action_id, "approval_id": approval.id},
         )
         enqueued = True
+    elif approval.decision == "rejected":
+        # A horizon run parked in AWAITING_APPROVAL must learn it was refused,
+        # or it waits forever. The worker treats this as a no-op for incidents
+        # the step loop is not driving.
+        queue = JobQueue(container.db)
+        await queue.enqueue(
+            kind="horizon_resume",
+            incident_id=approval.incident_id,
+            payload={
+                "action_id": approval.action_id,
+                "approval_id": approval.id,
+                "approved": False,
+            },
+        )
+        enqueued = True
     elif approval.decision == "more_evidence":
         queue = JobQueue(container.db)
         await queue.enqueue(

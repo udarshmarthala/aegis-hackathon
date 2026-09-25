@@ -55,6 +55,10 @@ COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
 COPY --chown=aegis:aegis migrations ./migrations
 COPY --chown=aegis:aegis src ./src
+# Committed fallback fixtures (the Nimble known-issue capture). The package is
+# installed into site-packages, so its path to them is named explicitly.
+COPY --chown=aegis:aegis tests/fixtures ./tests/fixtures
+ENV AEGIS_FIXTURES_DIR=/app/tests/fixtures
 
 # Never run as root: a container escape should not begin with uid 0.
 USER aegis

@@ -116,6 +116,9 @@ class Worker:
         # action the worker also refuses to run autonomously.
         self._container = build_container(self._settings)
         self._db = self._container.db
+        # The step loop's long-lived collaborators. None when the LangGraph
+        # pipeline is the configured driver.
+        self._horizon: Any = None
 
     async def start(self) -> None:
         s = self._settings
@@ -132,6 +135,16 @@ class Worker:
         if unavailable:
             log.info("worker running with degraded capabilities",
                      unavailable=unavailable)
+
+        if s.horizon_driver == "horizon":
+            from aegis.worker.horizon_runtime import HorizonRuntime
+
+            self._horizon = HorizonRuntime(self._container, s)
+            await self._horizon.start()
+
+        # Before the first claim: anything this worker id still holds belongs
+        # to a previous incarnation that was killed mid-step.
+        await JobQueue(self._db).reclaim_own(self.worker_id)
 
         reaper = asyncio.create_task(self._reap_loop())
         try:
@@ -150,6 +163,8 @@ class Worker:
         if self._inflight:
             log.info("draining", jobs=len(self._inflight))
             await asyncio.gather(*self._inflight, return_exceptions=True)
+        if self._horizon is not None:
+            await self._horizon.aclose()
         await self._container.aclose()
         log.info("worker stopped", worker_id=self.worker_id)
 
@@ -172,7 +187,8 @@ class Worker:
                 continue
             try:
                 job = await queue.claim(
-                    self.worker_id, kinds=["investigate", "execute_action"]
+                    self.worker_id,
+                    kinds=["investigate", "execute_action", "horizon_resume"],
                 )
             except Exception as exc:  # noqa: BLE001
                 # A database blip must not kill the worker; back off and retry.
@@ -190,10 +206,66 @@ class Worker:
             task.add_done_callback(self._inflight.discard)
 
     async def _run_job(self, job: dict[str, Any]) -> None:
-        if job.get("kind") == "execute_action":
+        kind = job.get("kind")
+        if self._horizon is not None:
+            if kind == "horizon_resume":
+                await self._run_horizon(job, resume=True)
+                return
+            if kind == "execute_action":
+                payload = job.get("payload") or {}
+                if await self._horizon.owns_action(
+                    job["incident_id"], str(payload.get("action_id", ""))
+                ):
+                    await self._run_horizon(job, resume=True)
+                    return
+            elif kind == "investigate":
+                await self._run_horizon(job, resume=False)
+                return
+        elif kind == "horizon_resume":
+            # A denial for an incident the step loop is not driving: nothing
+            # is parked on it, so there is nothing to resume.
+            await JobQueue(self._db).complete(job["id"])
+            return
+        if kind == "execute_action":
             await self._run_execution(job)
             return
         await self._run_investigation_job(job)
+
+    async def _run_horizon(self, job: dict[str, Any], *, resume: bool) -> None:
+        """Drive (or resume) one incident with the step loop.
+
+        The orchestrator checkpoints after every step and re-gates on every
+        approval, so this wrapper only binds context and settles the job. A
+        failure leaves the checkpoint in place; the retry resumes from it.
+        """
+        queue = JobQueue(self._db)
+        incident_id = job["incident_id"]
+        payload = job.get("payload") or {}
+        bind_correlation_id(correlation_id())
+        bind_incident_id(incident_id)
+        try:
+            if resume:
+                action_id = str(payload.get("action_id", ""))
+                # An ``execute_action`` job only exists for a granted approval;
+                # a ``horizon_resume`` job carries the decision explicitly.
+                approved = bool(payload.get("approved", job.get("kind") == "execute_action"))
+                state = await self._horizon.resume(incident_id, action_id, approved)
+            else:
+                state = await self._horizon.run_incident(incident_id)
+            await queue.complete(job["id"])
+            log.info(
+                "horizon run settled",
+                incident_id=incident_id,
+                phase=getattr(getattr(state, "phase", None), "value", None),
+                step=getattr(state, "step", None),
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad job must not kill the worker
+            log.exception("horizon run failed", incident_id=incident_id, error=str(exc))
+            with contextlib.suppress(Exception):
+                await queue.fail(job["id"], f"{type(exc).__name__}: {exc}")
+        finally:
+            bind_correlation_id(None)
+            bind_incident_id(None)
 
     async def _run_execution(self, job: dict[str, Any]) -> None:
         """Execute an action a human approved.

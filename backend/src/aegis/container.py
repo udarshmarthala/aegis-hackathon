@@ -132,6 +132,17 @@ class Container:
     tool_registry: ToolRegistry | None = None
     tools: ToolInvoker | None = None
 
+    # Long-horizon agent. Every sponsor integration is optional and has a
+    # labelled fallback behind the same Protocol, so any of these may be None
+    # without the step loop losing its ability to run the golden path.
+    horizon_store: Any = None
+    brain: Any = None
+    compactor_llm: Any = None
+    rawtree: Any = None
+    rawtree_tools: Any = None
+    known_issues: Any = None
+    incident_map: Any = None
+
     capabilities: dict[str, Capability] = field(default_factory=dict)
 
     def _mark(self, name: str, configured: bool, reason: str = "") -> None:
@@ -286,6 +297,87 @@ class Container:
             s.sandbox_enabled,
             "" if s.sandbox_enabled else "SANDBOX_ENABLED is false",
         )
+
+    def build_horizon(self) -> None:
+        """Construct the step loop's collaborators, each with its fallback.
+
+        Built in both processes: the worker drives incidents with them, and the
+        API reports their readiness on the war-room page. Construction performs
+        no I/O - the RawTree writer task is started by whichever process owns
+        the write path (the worker), never by the API.
+        """
+        s = self.settings
+
+        try:
+            from aegis.persistence.horizon import PostgresHorizonStore
+
+            self.horizon_store = PostgresHorizonStore(self.db)
+            self._mark("horizon_store", True)
+        except Exception as exc:  # noqa: BLE001 - reported, the loop falls back
+            self._mark("horizon_store", False, f"{type(exc).__name__}: {exc}")
+
+        try:
+            from aegis.agents.brain.router import BrainRouter
+            from aegis.agents.horizon.scripted import ScriptedBrain
+
+            self.brain = BrainRouter(s, scripted=ScriptedBrain())
+            self._mark("brain", True, f"mode={s.aegis_mode}")
+            bedrock_ok = bool(s.bedrock_model_id and s.aws_region)
+            self._mark(
+                "bedrock",
+                bedrock_ok,
+                "" if bedrock_ok else "BEDROCK_MODEL_ID or AWS_REGION is not set",
+            )
+            gemini_ok = bool(s.gemini_pool_keys("brain"))
+            self._mark("gemini", gemini_ok, "" if gemini_ok else "brain key pool is empty")
+        except Exception as exc:  # noqa: BLE001
+            self._mark("brain", False, f"{type(exc).__name__}: {exc}")
+
+        try:
+            from aegis.agents.brain.compactor_llm import GeminiCompactorLLM
+
+            self.compactor_llm = GeminiCompactorLLM(s)
+            ok = bool(self.compactor_llm.configured)
+            self._mark(
+                "compactor_llm",
+                ok,
+                "" if ok else "compactor key pool is empty; rule compactor only",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._mark("compactor_llm", False, f"{type(exc).__name__}: {exc}")
+
+        try:
+            from aegis.integrations.rawtree import RawTreeClient
+            from aegis.integrations.rawtree_mcp import RawTreeAgentTools
+
+            self.rawtree = RawTreeClient(s, fallback_store=self.horizon_store, db=self.db)
+            self.rawtree_tools = RawTreeAgentTools(s)
+            ok = bool(self.rawtree.write_configured and self.rawtree.read_configured)
+            self._mark(
+                "rawtree",
+                ok,
+                "" if ok else "RawTree keys missing; heartbeat uses z-score, history uses Postgres",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._mark("rawtree", False, f"{type(exc).__name__}: {exc}")
+
+        try:
+            from aegis.integrations.nimble import NimbleKnownIssues
+
+            self.known_issues = NimbleKnownIssues(s)
+            ok = bool(s.nimble_api_key.get_secret_value())
+            self._mark("nimble", ok, "" if ok else "NIMBLE_API_KEY missing; fixture is used")
+        except Exception as exc:  # noqa: BLE001
+            self._mark("nimble", False, f"{type(exc).__name__}: {exc}")
+
+        try:
+            from aegis.integrations.bfl import FluxIncidentMap
+
+            self.incident_map = FluxIncidentMap(s)
+            ok = bool(s.bfl_api_key.get_secret_value())
+            self._mark("flux", ok, "" if ok else "BFL_API_KEY missing; incident map skipped")
+        except Exception as exc:  # noqa: BLE001
+            self._mark("flux", False, f"{type(exc).__name__}: {exc}")
 
     def _commit_source(self) -> Any:
         """Adapt the GitHub client onto the narrow interface code retrieval needs.
@@ -446,6 +538,8 @@ class Container:
             getattr(self.github, "close", None),
             getattr(self.embeddings, "aclose", None),
             getattr(self.sandbox, "close", None),
+            getattr(self.compactor_llm, "aclose", None),
+            getattr(self.brain, "aclose", None),
         ):
             if closer is None:
                 continue
@@ -509,6 +603,7 @@ def build_container(settings: Settings) -> Container:
     container.build_core()
     container.build_optional()
     container.build_execution()
+    container.build_horizon()
     return container
 
 

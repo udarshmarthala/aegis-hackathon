@@ -44,6 +44,14 @@ function baseUrl(): string {
   return process.env.AEGIS_API_INTERNAL_URL ?? published;
 }
 
+/**
+ * The API origin, for callers that must build a URL themselves (streams and
+ * authenticated image fetches). Everything else goes through `request`.
+ */
+export function apiBaseUrl(): string {
+  return baseUrl();
+}
+
 let authToken: string | null = null;
 
 export function setAuthToken(token: string | null) {
@@ -68,7 +76,12 @@ export function onUnauthorized(handler: UnauthorizedHandler): () => void {
   };
 }
 
-function notifyUnauthorized() {
+/**
+ * Exported for the streaming clients, which cannot go through `request`: a
+ * long-lived SSE body is read incrementally, so it needs its own fetch, but a
+ * rejected credential there must end the session exactly as it would here.
+ */
+export function notifyUnauthorized() {
   for (const handler of unauthorizedHandlers) {
     try {
       handler();
