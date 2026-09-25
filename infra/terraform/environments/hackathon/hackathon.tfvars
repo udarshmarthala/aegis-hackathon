@@ -25,7 +25,7 @@ aegis_env = "production"
 # FIRST apply: no image exists at "bootstrap", so both services start at 0 and
 # the first deploy-hackathon run (bring_up = true) starts them. After that run,
 # set both counts to 1 and image_tag to the deployed commit SHA, then re-apply.
-image_tag            = "7c30275fe7480627d9b2dec7fb7cc15256337d38"
+image_tag            = "2ea5cf539792e92bde5a7194f0801640147f0567"
 api_desired_count    = 1
 worker_desired_count = 1
 
@@ -52,8 +52,8 @@ bedrock_fallback_model_id = "us.anthropic.claude-sonnet-4-6"
 
 # Keys that MUST exist in the aegis-hackathon/app JSON secret, or ECS refuses to
 # start the task. Remove an integration from BOTH lists if you have no key.
-api_secret_keys    = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3", "GOOGLE_API_KEY_4", "GOOGLE_API_KEY_5", "GOOGLE_API_KEY_6", "GOOGLE_API_KEY_7", "GOOGLE_API_KEY_8", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY"]
-worker_secret_keys = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3", "GOOGLE_API_KEY_4", "GOOGLE_API_KEY_5", "GOOGLE_API_KEY_6", "GOOGLE_API_KEY_7", "GOOGLE_API_KEY_8", "RAWTREE_WRITE_KEY", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY"]
+api_secret_keys    = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3", "GOOGLE_API_KEY_4", "GOOGLE_API_KEY_5", "GOOGLE_API_KEY_6", "GOOGLE_API_KEY_7", "GOOGLE_API_KEY_8", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY", "LANGSMITH_API_KEY"]
+worker_secret_keys = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3", "GOOGLE_API_KEY_4", "GOOGLE_API_KEY_5", "GOOGLE_API_KEY_6", "GOOGLE_API_KEY_7", "GOOGLE_API_KEY_8", "RAWTREE_WRITE_KEY", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY", "LANGSMITH_API_KEY"]
 
 neo4j_uri = ""
 

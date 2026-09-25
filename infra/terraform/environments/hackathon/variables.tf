@@ -389,3 +389,15 @@ variable "github_immutable_sub_prefix" {
   type        = string
   default     = ""
 }
+
+variable "service_discovery_namespace" {
+  description = "Private DNS namespace the support tier registers in."
+  type        = string
+  default     = "aegis.internal"
+}
+
+variable "obs_desired_count" {
+  description = "Tasks for the Redis/Neo4j/Prometheus/Tempo/Loki support tier (0 turns it off)."
+  type        = number
+  default     = 1
+}

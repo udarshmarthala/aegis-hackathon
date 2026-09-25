@@ -24,17 +24,16 @@ locals {
     POSTGRES_DB   = aws_db_instance.this.db_name
     POSTGRES_USER = aws_db_instance.this.username
 
-    # Not run on AWS. Each points at a name that cannot resolve, so the client
-    # fails fast and the capability is reported unavailable with a reason.
-    # Empty means "not deployed": the app skips the connection entirely and
-    # reports each as unconfigured rather than as a dependency that is down.
-    REDIS_HOST     = ""
-    NEO4J_URI      = var.neo4j_uri
-    PROMETHEUS_URL = ""
-    TEMPO_URL      = ""
-    LOKI_URL       = ""
-    # No collector to export to; exporting into the void costs retries.
-    OTEL_TRACES_ENABLED = "false"
+    # The support tier (observability.tf). With it scaled to zero these still
+    # resolve but refuse, and each capability reports unavailable with a reason.
+    REDIS_HOST     = local.obs_host
+    NEO4J_URI      = var.neo4j_uri != "" ? var.neo4j_uri : "bolt://${local.obs_host}:7687"
+    PROMETHEUS_URL = "http://${local.obs_host}:9090"
+    TEMPO_URL      = "http://${local.obs_host}:3200"
+    LOKI_URL       = "http://${local.obs_host}:3100"
+    # Traces go straight to Tempo's OTLP receiver; no separate collector.
+    OTEL_TRACES_ENABLED         = "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.obs_host}:4317"
 
     # The brain: Bedrock through the task role (botocore's default chain, no
     # keys, no profile), primary model with a verified fallback.
@@ -55,7 +54,7 @@ locals {
     WORKLOAD_ADAPTER         = "ecs"
     ECS_CLUSTER              = ""
     WORKLOAD_METRICS_TARGETS = ""
-    LANGSMITH_TRACING        = "false"
+    LANGSMITH_TRACING        = "true"
 
     FIREBASE_PROJECT_ID = var.firebase_project_id
 
