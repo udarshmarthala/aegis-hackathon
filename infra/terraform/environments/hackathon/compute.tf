@@ -48,12 +48,13 @@ locals {
     # ECS adapter reports itself unavailable), and no write permission in the
     # worker's IAM role. There is no Docker daemon on Fargate, so the sandbox
     # is off too rather than failing on every call.
-    AUTONOMY_ENABLED         = "false"
-    AUTH_DEV_MODE            = "false"
-    SANDBOX_ENABLED          = "false"
-    WORKLOAD_ADAPTER         = "ecs"
-    ECS_CLUSTER              = ""
-    WORKLOAD_METRICS_TARGETS = ""
+    AUTONOMY_ENABLED = "false"
+    AUTH_DEV_MODE    = "false"
+    SANDBOX_ENABLED  = "false"
+    WORKLOAD_ADAPTER = "ecs"
+    # The observed workload's own cluster (workload.tf); read-only IAM.
+    ECS_CLUSTER              = aws_ecs_cluster.workload.name
+    WORKLOAD_METRICS_TARGETS = join(",", [for name, _ in local.workload_services : "${name}=http://${name}.${var.service_discovery_namespace}:8080/metrics"])
     LANGSMITH_TRACING        = "true"
 
     FIREBASE_PROJECT_ID = var.firebase_project_id

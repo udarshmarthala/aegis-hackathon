@@ -52,6 +52,15 @@ locals {
         static_configs:
           - targets: ["localhost:3100"]
             labels: { service: loki }
+      - job_name: workload
+        honor_labels: true
+        static_configs:
+          - targets: ["gateway.${var.service_discovery_namespace}:8080"]
+            labels: { service: gateway }
+          - targets: ["checkout.${var.service_discovery_namespace}:8080"]
+            labels: { service: checkout }
+          - targets: ["payment.${var.service_discovery_namespace}:8080"]
+            labels: { service: payment }
   YAML
 
   obs_log = {

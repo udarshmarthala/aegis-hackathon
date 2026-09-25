@@ -401,3 +401,15 @@ variable "obs_desired_count" {
   type        = number
   default     = 1
 }
+
+variable "workload_image_tag" {
+  description = "Tag of the workload image (gateway/checkout/payment) in the workload ECR repository."
+  type        = string
+  default     = "1.4.1"
+}
+
+variable "workload_desired_count" {
+  description = "Tasks per workload service (0 stops the observed workload)."
+  type        = number
+  default     = 1
+}
