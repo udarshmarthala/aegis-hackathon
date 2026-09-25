@@ -6,7 +6,7 @@
 # file (`make workload-images`): a healthy one, and one whose BAKED_FAULT is
 # listed for its own version, so the fault ships with the deploy the way a real
 # regression does. See service.py, "Faults that ship in the image".
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ARG WORKLOAD_VERSION=1.0.0
 ARG BAKED_FAULT=""
