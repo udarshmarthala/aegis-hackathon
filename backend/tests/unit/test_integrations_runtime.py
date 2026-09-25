@@ -103,6 +103,9 @@ class FakeContainer:
     def start(self) -> None:
         self.calls.append(("start",))
 
+    def reload(self) -> None:
+        self.calls.append(("reload",))
+
     def logs(self, **kwargs) -> bytes:
         self.calls.append(("logs", kwargs))
         return b"starting up\nuser 7 not found\nready\n"
@@ -509,3 +512,47 @@ async def test_a_replacement_that_fails_to_start_is_removed_and_the_old_one_kept
     replacement = docker._containers[-1]
     assert ("remove", True) in replacement.calls
     assert ("stop", 30) not in old.calls
+
+
+async def test_the_replacement_joins_the_service_name_only_once_it_is_ready():
+    # Joined while still booting, it would take live traffic it cannot serve and
+    # the redeploy itself would read as an outage.
+    old = FakeContainer("aaaaaaaaaaaa11", "checkout", image="aegis/workload:1.4.2")
+    adapter = compose([old])
+    docker = adapter._client
+    order: list[str] = []
+    original_create = docker.containers.create
+
+    def tracking_create(image, **kwargs):
+        created = original_create(image, **kwargs)
+        created.attrs["State"] = {"Status": "running", "Health": {"Status": "starting"}}
+        polls = {"n": 0}
+
+        def reload() -> None:
+            polls["n"] += 1
+            order.append("reload")
+            if polls["n"] >= 2:
+                created.attrs["State"]["Health"]["Status"] = "healthy"
+
+        created.reload = reload
+        return created
+
+    docker.containers.create = tracking_create
+    original_get = docker.networks.get
+
+    def tracking_get(name):
+        network = original_get(name)
+        original_connect = network.connect
+
+        def connect(container, aliases=None):
+            order.append("connect")
+            original_connect(container, aliases=aliases)
+
+        network.connect = connect
+        return network
+
+    docker.networks.get = tracking_get
+    await adapter.rollback_deployment("checkout", "1.4.1", idempotency_key="act_40")
+
+    assert order.index("connect") > order.index("reload")
+    assert order.count("reload") >= 2

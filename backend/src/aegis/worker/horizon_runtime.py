@@ -95,7 +95,24 @@ class HorizonRuntime:
 
     def _spawn(self, coro: Any, name: str) -> None:
         task = asyncio.create_task(coro, name=f"horizon:{name}")
+        task.add_done_callback(self._report_exit)
         self._tasks.append(task)
+
+    def _report_exit(self, task: asyncio.Task[Any]) -> None:
+        """Make a background loop's death loud.
+
+        These loops are meant to run until shutdown. One that ends early -
+        above all the heartbeat - means faults stop being detected, and without
+        this the only symptom is silence.
+        """
+        if task.cancelled() or self._stop.is_set():
+            return
+        exc = task.exception()
+        log.error(
+            "horizon background task stopped unexpectedly",
+            task=task.get_name(),
+            error=f"{type(exc).__name__}: {exc}" if exc else "returned early",
+        )
 
     # ------------------------------------------------------------------ #
     # incidents                                                           #

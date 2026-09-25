@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import os
 import re
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -68,6 +69,8 @@ MAX_REPLICAS: Final = 10
 # reclaim its own replicas and will never remove the operator's original.
 AEGIS_MANAGED_LABEL: Final = "io.aegis.managed"
 COMPOSE_PROJECT_LABEL: Final = "com.docker.compose.project"
+# How long a redeploy waits for its replacement to report healthy.
+REPLACEMENT_READY_TIMEOUT_S: Final = 45.0
 # Docker's built-in networks; never part of a Compose project's topology.
 _DOCKER_BUILTIN_NETWORKS: Final = frozenset({"bridge", "host", "none"})
 # Labels that describe an image build rather than a deployment decision.
@@ -975,6 +978,11 @@ class ComposeAdapter(RuntimeAdapter):
             restart_policy={"Name": "unless-stopped"},
         )
         try:
+            # Started first and only then given the service's DNS name: joined
+            # before it listens, it would take a share of live traffic while
+            # still booting, and the redeploy itself would look like an outage.
+            container.start()
+            self._await_ready(container)
             # Joined with the service name as a DNS alias, as Compose does.
             # Without it, callers resolving ``checkout`` lose the service the
             # moment the original container is removed. Only the service name:
@@ -986,7 +994,6 @@ class ComposeAdapter(RuntimeAdapter):
                 # it, so neither is the replacement.
                 with contextlib.suppress(Exception):
                     client.networks.get("bridge").disconnect(container)
-            container.start()
         except Exception:
             # A replacement that never started must not linger as a "created"
             # container that later reads as a running version of the service.
@@ -994,6 +1001,35 @@ class ComposeAdapter(RuntimeAdapter):
                 container.remove(force=True)
             raise
         return str(getattr(container, "id", ""))[:12]
+
+    @staticmethod
+    def _await_ready(container: Any, *, timeout_s: float = REPLACEMENT_READY_TIMEOUT_S) -> None:
+        """Block (on the adapter's worker thread) until the replacement serves.
+
+        Uses the image's healthcheck when it has one; without one, "running"
+        is the only readiness signal Docker can give. Raises when the
+        replacement never becomes ready, so the caller removes it and the old
+        container keeps serving - a failed rollback, not an outage.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            container.reload()
+            state = _as_dict((getattr(container, "attrs", {}) or {}).get("State"))
+            status = str(state.get("Status", "") or getattr(container, "status", ""))
+            health = str(_as_dict(state.get("Health")).get("Status", "") or "")
+            if status in ("exited", "dead"):
+                raise ExternalServiceError(
+                    "replacement container exited before becoming ready",
+                    context={"status": status},
+                )
+            if status == "running" and health in ("", "healthy"):
+                return
+            if time.monotonic() >= deadline:
+                raise ExternalServiceError(
+                    "replacement container did not become ready in time",
+                    context={"status": status, "health": health, "timeout_s": timeout_s},
+                )
+            time.sleep(0.5)
 
     @staticmethod
     def _container_only_env(client: Any, config: dict[str, Any]) -> list[str]:

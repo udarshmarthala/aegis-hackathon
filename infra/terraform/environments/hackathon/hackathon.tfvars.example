@@ -1,0 +1,53 @@
+# Copy to hackathon.tfvars (gitignored) and fill in.
+#
+#   cd infra/terraform/environments/hackathon
+#   terraform init
+#   AWS_PROFILE=aegis-admin terraform plan  -var-file=hackathon.tfvars -out=tfplan
+#   AWS_PROFILE=aegis-admin terraform apply tfplan
+#
+# docs/AWS_HACKATHON_ARCHITECTURE.md, "Bring-up", has the full order.
+
+aws_region = "us-west-2"
+owner      = "hackathon"
+
+# The Vercel production URL, exact. Add a preview URL only if you test from one.
+cors_allowed_origins = "https://aegis-hackathon.vercel.app"
+
+firebase_project_id = "your-firebase-project-id"
+enable_firebase     = true
+
+# "production" needs GOOGLE_API_KEY in the app secret (the backend's own
+# validator). "staging" does not, and also permits nothing extra unless
+# AUTH_DEV_MODE is set - which this environment never sets.
+aegis_env = "production"
+
+# First apply: leave as "bootstrap". Afterwards pass the SHA currently deployed:
+#   -var="image_tag=$(aws ecs describe-services ... )" or read it from the
+#   last deploy-hackathon run summary.
+image_tag        = "bootstrap"
+cpu_architecture = "ARM64"
+
+# Flip to false for the judging window: a Spot interruption mid-investigation
+# stalls that incident until the 15-minute stale-job reaper requeues it.
+worker_use_spot = true
+
+# Park the environment by setting both to 0 (RDS and the ALB keep billing).
+api_desired_count    = 1
+worker_desired_count = 1
+
+bedrock_model_id          = "us.anthropic.claude-sonnet-5"
+bedrock_fallback_model_id = "us.anthropic.claude-sonnet-4-6"
+
+# Remove any integration you do not have a key for, from BOTH lists.
+api_secret_keys    = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY"]
+worker_secret_keys = ["ALERT_INGEST_TOKEN", "GOOGLE_API_KEY", "RAWTREE_WRITE_KEY", "RAWTREE_READ_KEY", "NIMBLE_API_KEY", "BFL_API_KEY"]
+
+# Optional AuraDB Free. Add NEO4J_PASSWORD to both key lists when set.
+neo4j_uri = ""
+
+github_repository           = "udarshmarthala/aegis-hackathon"
+github_environment          = "aegis-hackathon"
+create_github_oidc_provider = true
+
+budget_limit_usd = 100
+budget_emails    = ["you@example.com"]

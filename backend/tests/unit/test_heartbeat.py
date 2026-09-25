@@ -413,3 +413,26 @@ async def test_anomaly_for_service_with_open_incident_is_deduplicated() -> None:
     db = FakeDb(existing="inc_existing")
     assert await open_incident_from_anomaly(db, _ANOMALY) is None  # type: ignore[arg-type]
     assert not any("INSERT" in q for q, _ in db.conn.executed)
+
+
+async def test_a_pass_that_raises_an_unexpected_type_does_not_end_detection() -> None:
+    # A heartbeat task that dies is indistinguishable from a quiet system, so a
+    # RuntimeError (or any type outside the expected set) in one pass must leave the loop running.
+    import asyncio
+
+    _w, _clock, rt, _fwd, hb, _seen = _heartbeat(read=True)
+    calls = {"n": 0}
+    stop = asyncio.Event()
+
+    async def flaky(name: str, params: dict[str, Any]) -> QueryResult:
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            stop.set()
+        raise RuntimeError("unexpected failure inside a dependency")
+
+    rt.named_query = flaky  # type: ignore[method-assign]
+    hb._settings = _settings(heartbeat_interval_s=0.01)
+    await asyncio.wait_for(hb.run(stop), timeout=5.0)
+
+    assert calls["n"] >= 3
+    assert hb.last_error is not None and "RuntimeError" in hb.last_error

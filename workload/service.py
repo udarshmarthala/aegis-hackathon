@@ -244,6 +244,12 @@ FAULT_ACTIVE = Gauge(
 )
 
 POOL_SIZE_G.labels(SERVICE).set(POOL_SIZE)
+# Exported at zero from boot. A labelled gauge otherwise appears only on first
+# use, and an idle pool would read as "no data" - which Aegis must treat as an
+# unavailable signal - instead of the healthy zero it actually is.
+POOL_IN_USE.labels(SERVICE).set(0)
+POOL_WAITERS.labels(SERVICE).set(0)
+POOL_EXHAUSTED.labels(SERVICE)
 _STARTED_AT_VALUE: Final = time.time()
 STARTED_AT.labels(SERVICE).set(_STARTED_AT_VALUE)
 

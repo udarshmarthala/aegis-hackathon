@@ -441,9 +441,12 @@ class Heartbeat:
             started = time.perf_counter()
             try:
                 await self.check_once()
-            except (AegisError, httpx.HTTPError, OSError, ValueError) as exc:
-                self.last_error = str(exc)
-                log.warning("heartbeat pass failed", error=str(exc))
+            except Exception as exc:  # noqa: BLE001 - one bad pass must not end detection
+                # Deliberately broad: a timeout or an unexpected type from any
+                # dependency would otherwise end the task, and a detector that
+                # has silently stopped is indistinguishable from a quiet system.
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                log.warning("heartbeat pass failed", error=self.last_error)
             remaining = max(0.1, interval - (time.perf_counter() - started))
             with contextlib.suppress(TimeoutError):  # next tick
                 await asyncio.wait_for(stop.wait(), timeout=remaining)
@@ -471,6 +474,12 @@ def _from_row(row: dict[str, Any], now: datetime) -> Anomaly | None:
 # --------------------------------------------------------------------------- #
 
 HEARTBEAT_SOURCE: Final = "heartbeat"
+
+
+# How recently an open incident must have moved to absorb a new anomaly on the
+# same service. Longer than any single investigation's quiet spell, far shorter
+# than the gap between two separate faults.
+ANOMALY_DEDUPE_WINDOW_S: Final = 1800
 
 
 async def open_incident_from_anomaly(
@@ -511,12 +520,17 @@ async def open_incident_from_anomaly(
             """
             SELECT i.id FROM incidents i
              WHERE i.resolved_at IS NULL
+               -- Only an incident someone is still working. An unresolved one
+               -- abandoned days ago must not swallow a fresh anomaly, or the
+               -- heartbeat detects the fault and nothing investigates it.
+               AND i.updated_at > now() - make_interval(secs => $2)
                AND ($1 = ANY(i.affected_services)
                     OR EXISTS (SELECT 1 FROM incident_alerts a
                                 WHERE a.incident_id = i.id AND a.service_hint = $1))
              ORDER BY i.created_at DESC LIMIT 1
             """,
             anomaly.service,
+            ANOMALY_DEDUPE_WINDOW_S,
         )
         if existing is not None:
             log.info(
