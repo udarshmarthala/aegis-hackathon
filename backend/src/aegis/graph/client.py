@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from aegis.core.config import Settings
-from aegis.core.errors import SourceUnavailable
+from aegis.core.errors import SourceNotConfigured, SourceUnavailable, is_unset
 from aegis.core.logging import get_logger
 from aegis.core.resilience import Bulkhead, guarded_call
 
@@ -28,7 +28,20 @@ class Neo4jClient:
         self._driver: Any = None
         self._bulkhead = Bulkhead("neo4j", limit=8)
 
+    @property
+    def configured(self) -> bool:
+        """False when ``NEO4J_URI`` is empty - Neo4j is not deployed."""
+        return not is_unset(self._settings.neo4j_uri)
+
+    def _require_configured(self) -> None:
+        # Checked before ``guarded_call``: an absent deployment is not an
+        # outage, so it is neither retried nor counted against the breaker, and
+        # no driver is built for a URI that names nothing.
+        if not self.configured:
+            raise SourceNotConfigured.for_setting("neo4j", "NEO4J_URI")
+
     def _ensure_driver(self) -> Any:
+        self._require_configured()
         if self._driver is None:
             from neo4j import AsyncGraphDatabase, NotificationDisabledClassification
 
@@ -72,6 +85,7 @@ class Neo4jClient:
 
     async def run(self, cypher: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute read-only Cypher behind timeout, retry, breaker and bulkhead."""
+        self._require_configured()
 
         async def _execute() -> list[dict[str, Any]]:
             driver = self._ensure_driver()
@@ -95,6 +109,7 @@ class Neo4jClient:
 
     async def write(self, cypher: str, params: dict[str, Any]) -> None:
         """Idempotent graph writes (always MERGE) for topology ingestion."""
+        self._require_configured()
 
         async def _execute() -> None:
             driver = self._ensure_driver()

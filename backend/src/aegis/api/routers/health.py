@@ -17,6 +17,7 @@ from fastapi import APIRouter, Request, Response
 
 from aegis.agents.llm import PROVIDER as LLM_PROVIDER
 from aegis.api.deps import DbDep, SettingsDep
+from aegis.core.errors import is_unset
 from aegis.core.logging import get_logger
 from aegis.core.resilience import breaker_states
 
@@ -63,14 +64,15 @@ async def health(db: DbDep, settings: SettingsDep) -> dict[str, Any]:
     components["neo4j"] = await _probe_neo4j(settings)
     components["redis"] = await _probe_redis(settings)
     components["prometheus"] = await _probe_http(
-        f"{settings.prometheus_url}/-/healthy", "prometheus",
-        ["metric evidence", "verification"],
+        settings.prometheus_url, "/-/healthy", "prometheus",
+        ["metric evidence", "verification"], setting="PROMETHEUS_URL",
     )
     components["tempo"] = await _probe_http(
-        f"{settings.tempo_url}/ready", "tempo", ["trace evidence", "causal paths"],
+        settings.tempo_url, "/ready", "tempo", ["trace evidence", "causal paths"],
+        setting="TEMPO_URL",
     )
     components["loki"] = await _probe_http(
-        f"{settings.loki_url}/ready", "loki", ["log evidence"],
+        settings.loki_url, "/ready", "loki", ["log evidence"], setting="LOKI_URL",
     )
 
     # Reported per key, not just per provider: three exhausted free-tier keys
@@ -119,13 +121,34 @@ async def health(db: DbDep, settings: SettingsDep) -> dict[str, Any]:
     }
 
 
-async def _probe_http(url: str, component: str, affects: list[str]) -> dict[str, Any]:
+def _not_deployed(setting: str, affects: list[str], component: str | None = None) -> dict[str, Any]:
+    """An empty connection setting: nothing is probed, and the reason says why.
+
+    Distinct from ``unavailable``. A deployment that omits a dependency on
+    purpose must not look, on this page, like one whose dependency has crashed.
+    """
+    entry: dict[str, Any] = {
+        "status": "unconfigured",
+        "hard_dependency": False,
+        "affects": affects,
+        "detail": f"not deployed ({setting} is empty)",
+    }
+    if component is not None:
+        entry["component"] = component
+    return entry
+
+
+async def _probe_http(
+    base_url: str, path: str, component: str, affects: list[str], *, setting: str
+) -> dict[str, Any]:
     """Soft probe with a short timeout - health must never hang."""
     import httpx
 
+    if is_unset(base_url):
+        return _not_deployed(setting, affects, component)
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(f"{base_url}{path}")
         healthy = resp.status_code < 400
         return {
             "status": "healthy" if healthy else "degraded",
@@ -146,6 +169,8 @@ async def _probe_http(url: str, component: str, affects: list[str]) -> dict[str,
 
 async def _probe_neo4j(settings: SettingsDep) -> dict[str, Any]:
     affects = ["topology", "blast radius", "causal paths"]
+    if is_unset(settings.neo4j_uri):
+        return _not_deployed("NEO4J_URI", affects)
     try:
         from aegis.graph.client import Neo4jClient
 
@@ -164,6 +189,8 @@ async def _probe_neo4j(settings: SettingsDep) -> dict[str, Any]:
 
 async def _probe_redis(settings: SettingsDep) -> dict[str, Any]:
     affects = ["live streaming", "rate limits", "cache"]
+    if is_unset(settings.redis_host):
+        return _not_deployed("REDIS_HOST", affects)
     try:
         import redis.asyncio as aioredis
 

@@ -2,6 +2,10 @@ import type {
   Diagnosis, EvidenceResponse, Health, HypothesesResponse,
   Incident, IncidentList, PolicyView, TimelineResponse,
 } from './types';
+// A deliberate import cycle: `war-room/sse` reads the token and the base URL
+// from this module. Neither side touches the other at load time, only inside
+// functions, so evaluation order cannot leave a binding undefined when used.
+import { openStream } from './war-room/sse';
 
 /**
  * API client.
@@ -208,27 +212,40 @@ export const api = {
     ),
 };
 
-/** Live incident stream. Returns a cleanup function. */
+/** The incident-stream events a caller is told about; `ping` and the rest are not. */
+const INCIDENT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'snapshot', 'phase', 'evidence', 'hypotheses', 'diagnosis',
+  'action_proposed', 'finished', 'update',
+]);
+
+/**
+ * Live incident stream. Returns a cleanup function.
+ *
+ * Built on the war room's fetch-based client rather than a native
+ * `EventSource`, which cannot send headers. The API authenticates from the
+ * `Authorization` header alone, so an event source was refused with 401 on
+ * every deployment - and the fix is not a query-string token, which would be
+ * written into every proxy and access log on the path. The shared client also
+ * keeps what `EventSource` gave for free: reconnection with backoff, resuming
+ * from `Last-Event-ID`, and a 401 ending the session like any other request.
+ */
 export function subscribeIncident(
   incidentId: string,
   onEvent: (type: string, data: unknown) => void,
 ): () => void {
-  const token = getAuthToken();
-  const url = new URL(`${baseUrl()}/v1/incidents/${incidentId}/stream`);
-  if (token) url.searchParams.set('access_token', token);
-
-  const source = new EventSource(url.toString());
-  const types = ['snapshot', 'phase', 'evidence', 'hypotheses', 'diagnosis',
-                 'action_proposed', 'finished', 'update'];
-
-  for (const type of types) {
-    source.addEventListener(type, (event) => {
+  return openStream({
+    path: `/v1/incidents/${encodeURIComponent(incidentId)}/stream`,
+    onFrame: (frame) => {
+      if (!INCIDENT_EVENT_TYPES.has(frame.event)) return;
       try {
-        onEvent(type, JSON.parse((event as MessageEvent).data));
+        onEvent(frame.event, JSON.parse(frame.data));
       } catch {
-        // A malformed frame is dropped rather than breaking the stream.
+        // A malformed frame - or a throwing subscriber - is dropped here. Left
+        // to reach the stream reader, it would tear down a healthy connection.
       }
-    });
-  }
-  return () => source.close();
+    },
+    // Connection state is not part of this function's contract; the page
+    // reconciles from its queries whether or not the stream is live.
+    onStatus: () => {},
+  });
 }

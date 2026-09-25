@@ -25,7 +25,12 @@ from typing import Any
 import httpx
 
 from aegis.core.config import Settings
-from aegis.core.errors import SourceUnavailable, ValidationError
+from aegis.core.errors import (
+    SourceNotConfigured,
+    SourceUnavailable,
+    ValidationError,
+    is_unset,
+)
 from aegis.core.logging import get_logger
 from aegis.core.resilience import Bulkhead, guarded_call
 
@@ -242,7 +247,19 @@ class TempoClient:
         self._bulkhead = Bulkhead("tempo", limit=8)
         self._client: httpx.AsyncClient | None = None
 
+    @property
+    def configured(self) -> bool:
+        """False when ``TEMPO_URL`` is empty - Tempo is not deployed."""
+        return not is_unset(self._settings.tempo_url)
+
+    def _require_configured(self) -> None:
+        # Before ``guarded_call``, not inside it: an absent deployment is not an
+        # outage, so it is neither retried nor counted against the breaker.
+        if not self.configured:
+            raise SourceNotConfigured.for_setting("tempo", "TEMPO_URL")
+
     async def _http(self) -> httpx.AsyncClient:
+        self._require_configured()
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._settings.tempo_url,
@@ -262,6 +279,7 @@ class TempoClient:
         The distinction that matters is the same one Prometheus makes: an empty
         result means 'no such trace', an exception means 'we could not look'.
         """
+        self._require_configured()
 
         async def _call() -> dict[str, Any]:
             client = await self._http()

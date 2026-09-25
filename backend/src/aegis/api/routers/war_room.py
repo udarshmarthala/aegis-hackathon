@@ -33,6 +33,7 @@ from aegis.core.errors import (
     AuthorizationError,
     NotFoundError,
     SourceUnavailable,
+    is_unset,
 )
 from aegis.core.logging import get_logger
 from aegis.core.resilience import guarded_call
@@ -222,7 +223,9 @@ class HealthProbe:
 
     async def _build(self) -> dict[str, Any]:
         prom = self._prometheus
-        if prom is None:
+        # An undeployed Prometheus would answer each of the queries below with
+        # ``SourceNotConfigured`` anyway; skipping them just saves the fan-out.
+        if prom is None or not getattr(prom, "configured", True):
             return self._unavailable()
         calls: list[Any] = []
         for svc in SERVICES:
@@ -359,7 +362,9 @@ def _integrations(settings: Settings) -> dict[str, dict[str, Any]]:
             bool(settings.bfl_api_key.get_secret_value()),
             "BFL_API_KEY is not set; incident maps are unavailable",
         ),
-        "prometheus": entry(bool(settings.prometheus_url), "PROMETHEUS_URL is not set"),
+        "prometheus": entry(
+            not is_unset(settings.prometheus_url), "not deployed (PROMETHEUS_URL is empty)"
+        ),
     }
 
 

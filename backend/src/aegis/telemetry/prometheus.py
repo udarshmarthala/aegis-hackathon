@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from aegis.core.config import Settings
-from aegis.core.errors import SourceUnavailable
+from aegis.core.errors import SourceNotConfigured, SourceUnavailable, is_unset
 from aegis.core.logging import get_logger
 from aegis.core.resilience import Bulkhead, guarded_call
 
@@ -76,7 +76,20 @@ class PrometheusClient:
         self._bulkhead = Bulkhead("prometheus", limit=8)
         self._client: httpx.AsyncClient | None = None
 
+    @property
+    def configured(self) -> bool:
+        """False when ``PROMETHEUS_URL`` is empty - Prometheus is not deployed."""
+        return not is_unset(self._settings.prometheus_url)
+
+    def _require_configured(self) -> None:
+        # Checked before ``guarded_call`` rather than inside it: an absent
+        # deployment is not an outage, so it must neither be retried nor count
+        # against the breaker that protects a real Prometheus.
+        if not self.configured:
+            raise SourceNotConfigured.for_setting("prometheus", "PROMETHEUS_URL")
+
     async def _http(self) -> httpx.AsyncClient:
+        self._require_configured()
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._settings.prometheus_url,
@@ -99,6 +112,7 @@ class PrometheusClient:
         exception means 'we could not look'. Collapsing them would let the
         investigation silently treat an outage as evidence of health.
         """
+        self._require_configured()
 
         async def _call() -> dict[str, Any]:
             client = await self._http()
@@ -291,6 +305,7 @@ class PrometheusClient:
         "we could not ask". The caller must be able to tell those apart, or it
         will record no evidence gap and quietly reason from nothing.
         """
+        self._require_configured()
 
         async def _call() -> list[str]:
             client = await self._http()

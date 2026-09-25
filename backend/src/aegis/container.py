@@ -25,6 +25,7 @@ from typing import Any
 
 from aegis.agents.llm import ModelRouter
 from aegis.core.config import Settings
+from aegis.core.errors import is_unset
 from aegis.core.logging import get_logger
 from aegis.core.resilience import retry_async
 from aegis.evidence.store import EvidenceStore
@@ -53,6 +54,12 @@ from aegis.verification.engine import VerificationEngine
 from aegis.verification.store import VerificationStore
 
 log = get_logger(__name__)
+
+
+def _not_deployed(setting: str) -> str:
+    # The same phrasing ``SourceNotConfigured`` uses, so the capability report
+    # and the evidence gap it explains read as one statement.
+    return f"not deployed ({setting} is empty)"
 
 
 @dataclass
@@ -150,6 +157,14 @@ class Container:
         if not configured:
             log.info("capability unavailable", capability=name, reason=reason)
 
+    def _mark_telemetry(self, name: str, client: Any, setting: str) -> None:
+        if client is None:
+            self._mark(name, False, "not constructed")
+        elif not client.configured:
+            self._mark(name, False, _not_deployed(setting))
+        else:
+            self._mark(name, True)
+
     def build_core(self) -> None:
         """Construct everything that only needs Postgres and configuration."""
         s = self.settings
@@ -193,17 +208,28 @@ class Container:
         """
         s = self.settings
 
+        # Built in ``build_core`` because verification needs it unconditionally;
+        # reported here so an operator can tell "not deployed" from "down".
+        prometheus_ok = not is_unset(s.prometheus_url)
+        self._mark(
+            "prometheus", prometheus_ok, "" if prometheus_ok else _not_deployed("PROMETHEUS_URL")
+        )
+
+        # An unconfigured Tempo or Loki is still constructed: the client answers
+        # every read with ``SourceNotConfigured`` at once, so the tool boundary
+        # records an evidence gap that names the missing setting instead of the
+        # vaguer "client is not configured" a ``None`` dependency would give.
         with contextlib.suppress(Exception):
             from aegis.telemetry.tempo import TempoClient
 
             self.tempo = TempoClient(s)
-        self._mark("tempo", self.tempo is not None, "" if self.tempo else "not constructed")
+        self._mark_telemetry("tempo", self.tempo, "TEMPO_URL")
 
         with contextlib.suppress(Exception):
             from aegis.telemetry.loki import LokiClient
 
             self.loki = LokiClient(s)
-        self._mark("loki", self.loki is not None, "" if self.loki else "not constructed")
+        self._mark_telemetry("loki", self.loki, "LOKI_URL")
 
         try:
             from aegis.integrations.github import GitHubClient
@@ -278,7 +304,10 @@ class Container:
             self.topology = GraphTraversal(self.neo4j)
             self.graphrag = GraphRAG(self.topology)
             self.graph_ingest = TopologyIngestor(self.neo4j)
-            self._mark("graph", True)
+            # Constructed either way, for the same reason as Tempo and Loki:
+            # the client answers with a reason that names the missing setting.
+            graph_ok = self.neo4j.configured
+            self._mark("graph", graph_ok, "" if graph_ok else _not_deployed("NEO4J_URI"))
         except Exception as exc:  # noqa: BLE001
             self._mark("graph", False, f"{type(exc).__name__}: {exc}")
 
@@ -481,6 +510,21 @@ class Container:
         """
         await self.db.connect()
 
+        await self.connect_redis()
+
+        self.build_execution()
+
+        await self.ensure_graph_schema()
+
+    async def connect_redis(self) -> None:
+        """Open Redis if it is deployed, recording why not when it is not."""
+        if is_unset(self.settings.redis_host):
+            # Not deployed, so there is nothing to ping. ``redis_url`` would
+            # still render "redis://:6379/0", and the ping's connection error
+            # would read as an outage of something that was never there.
+            self.redis = None
+            self._mark("redis", False, _not_deployed("REDIS_HOST"))
+            return
         try:
             import redis.asyncio as aioredis
 
@@ -493,10 +537,6 @@ class Container:
             log.warning("redis unavailable; live stream degraded", error=str(exc))
             self.redis = None
             self._mark("redis", False, f"{type(exc).__name__}: {exc}")
-
-        self.build_execution()
-
-        await self.ensure_graph_schema()
 
     async def ensure_graph_schema(self) -> bool:
         """Apply the graph schema and report whether topology is usable now.
@@ -512,6 +552,11 @@ class Container:
         is IF NOT EXISTS), so repeating it costs nothing.
         """
         if self.graph_ingest is None:
+            return False
+        if is_unset(self.settings.neo4j_uri):
+            # No retry: four attempts against a setting that names nothing
+            # cost about fifteen seconds of boot and prove nothing.
+            self._mark("graph", False, _not_deployed("NEO4J_URI"))
             return False
         try:
             await retry_async(

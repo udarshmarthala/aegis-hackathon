@@ -143,6 +143,40 @@ class SourceUnavailable(ExternalServiceError):
     http_status = 503
 
 
+class SourceNotConfigured(SourceUnavailable):
+    """The evidence source is not deployed here, so nothing was attempted.
+
+    Still a ``SourceUnavailable`` - and still coded ``SOURCE_UNAVAILABLE`` - so
+    every caller keeps recording an evidence gap rather than reading the absence
+    as "found nothing". What it adds is the reason: "not deployed" and "down"
+    call for different operator responses, and a deployment that deliberately
+    omits Neo4j should not look like one whose Neo4j has crashed.
+
+    Never retryable. Retrying a missing setting cannot make it present, and
+    each retry is only boot latency.
+    """
+
+    retryable = False
+
+    @classmethod
+    def for_setting(cls, dependency: str, setting: str) -> SourceNotConfigured:
+        """The one wording every client uses, so the UI sees a single phrasing."""
+        return cls(
+            f"{dependency} not deployed ({setting} is empty)",
+            context={"dependency": dependency, "setting": setting, "not_configured": True},
+        )
+
+
+def is_unset(value: str) -> bool:
+    """Whether a connection setting means "this dependency is not deployed".
+
+    Whitespace counts as empty: an env var rendered from a blank template
+    variable is as absent as one that was never set, and treating it as a
+    hostname would only produce a connection error with a misleading cause.
+    """
+    return not value.strip()
+
+
 class CircuitOpen(ExternalServiceError):
     """The breaker is open; the call was rejected without attempting it."""
 

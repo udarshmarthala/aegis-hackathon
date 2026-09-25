@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from aegis.core.config import Settings
+from aegis.core.errors import is_unset
 from aegis.core.logging import get_logger
 from aegis.integrations.github import GitHubClient, GitHubRateLimited
 from aegis.integrations.langsmith import LangSmithIntegration, RunHandle
@@ -148,8 +149,8 @@ async def health(
 
 
 async def _telemetry(url: str, path: str, setting_name: str) -> dict[str, Any]:
-    if not url:
-        return _entry(False, None, f"{setting_name} is not set")
+    if is_unset(url):
+        return _entry(False, None, f"not deployed ({setting_name.upper()} is empty)")
     healthy, reason = await _probe_url(url, path)
     return _entry(True, healthy, reason)
 

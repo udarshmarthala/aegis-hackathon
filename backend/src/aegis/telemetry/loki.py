@@ -28,7 +28,12 @@ from typing import Any
 import httpx
 
 from aegis.core.config import Settings
-from aegis.core.errors import SourceUnavailable, ValidationError
+from aegis.core.errors import (
+    SourceNotConfigured,
+    SourceUnavailable,
+    ValidationError,
+    is_unset,
+)
 from aegis.core.logging import get_logger
 from aegis.core.resilience import Bulkhead, guarded_call
 from aegis.domain.models import UntrustedText
@@ -213,7 +218,19 @@ class LokiClient:
         self._bulkhead = Bulkhead("loki", limit=8)
         self._client: httpx.AsyncClient | None = None
 
+    @property
+    def configured(self) -> bool:
+        """False when ``LOKI_URL`` is empty - Loki is not deployed."""
+        return not is_unset(self._settings.loki_url)
+
+    def _require_configured(self) -> None:
+        # Before ``guarded_call``, not inside it: an absent deployment is not an
+        # outage, so it is neither retried nor counted against the breaker.
+        if not self.configured:
+            raise SourceNotConfigured.for_setting("loki", "LOKI_URL")
+
     async def _http(self) -> httpx.AsyncClient:
+        self._require_configured()
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._settings.loki_url,
@@ -234,6 +251,7 @@ class LokiClient:
         means Loki holds no matching line; an exception means we could not ask.
         Collapsing the two would let an outage read as a healthy service.
         """
+        self._require_configured()
         params: dict[str, Any] = {
             "query": logql,
             # Loki takes nanosecond epochs.
