@@ -11,7 +11,7 @@ exactly-once delivery without any coordination between them.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 import asyncpg
 
@@ -20,6 +20,14 @@ from aegis.core.logging import get_logger
 from aegis.persistence.db import Database
 
 log = get_logger(__name__)
+
+
+# How long a job's lock survives without renewal. Workers renew every
+# ``RENEW_INTERVAL_S``; four missed renewals mean the worker is gone - on
+# Fargate Spot a replacement task has a new hostname, so only this reaper can
+# hand its work on.
+LEASE_SECONDS: Final = 120
+RENEW_INTERVAL_S: Final = 30.0
 
 
 class JobQueue:
@@ -117,7 +125,7 @@ class JobQueue:
             job_id, error[:2000], retry_in_s,
         )
 
-    async def reap_stale(self, *, older_than_s: int = 900) -> int:
+    async def reap_stale(self, *, older_than_s: int = LEASE_SECONDS) -> int:
         """Requeue jobs whose worker died holding them.
 
         Without this a hard-killed worker would leave its job 'running' forever.
@@ -135,6 +143,22 @@ class JobQueue:
         if count:
             log.warning("reaped stale jobs", count=count)
         return count
+
+    async def renew(self, worker_id: str) -> int:
+        """Refresh the lock on every job this worker is running.
+
+        A lease, not a claim-forever: a live worker renews well inside
+        ``LEASE_SECONDS``, so the reaper can treat any lock older than that as
+        abandoned without ever stealing work from a slow but healthy worker.
+        """
+        result = await self._db.execute(
+            """
+            UPDATE workflow_jobs SET locked_at = now(), updated_at = now()
+             WHERE status = 'running' AND locked_by = $1
+            """,
+            worker_id,
+        )
+        return int(result.split()[-1]) if result.startswith("UPDATE") else 0
 
     async def reclaim_own(self, worker_id: str) -> int:
         """Requeue jobs a previous incarnation of *this* worker was holding.

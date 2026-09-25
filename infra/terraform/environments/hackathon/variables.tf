@@ -26,8 +26,9 @@ variable "image_tag" {
     services). Pass the tag that is currently deployed when re-applying, or the
     next apply registers a revision pointing at an older image - harmless,
     because the services ignore task_definition, but confusing.
-    "bootstrap" is the first-apply placeholder: no such image exists, so the
-    services will not become healthy until the workflow has pushed one.
+    "bootstrap" is the first-apply placeholder: no such image exists, so apply
+    the first time with api_desired_count = worker_desired_count = 0 and let
+    the first workflow run (bring_up = true) start the services.
   EOT
   type        = string
   default     = "bootstrap"

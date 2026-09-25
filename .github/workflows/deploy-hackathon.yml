@@ -1,0 +1,376 @@
+# Deploy the BACKEND to the hackathon AWS environment
+# (infra/terraform/environments/hackathon). The frontend deploys itself on
+# Vercel and is not touched here.
+#
+#   build    -> one image per commit SHA, scanned, pushed to ECR. Skipped when
+#               the tag already exists: tags are immutable, so a SHA already in
+#               ECR is already the bytes that were scanned.
+#   migrate  -> one-off Fargate task on the NEW image, run to completion. A
+#               failed migration stops the deploy before any serving task moves.
+#   deploy   -> new API and worker revisions (the latest revision with only the
+#               image changed), update-service, wait for a steady state.
+#   verify   -> liveness, readiness, environment identity, and the fail-closed
+#               auth boundary, through CloudFront exactly as the browser sees it.
+#
+# This workflow never runs Terraform and its role cannot: Terraform is applied
+# by an operator with local state. The role can push one repository, register
+# revisions, run the migrate family and roll two services - nothing else.
+#
+# Manual dispatch only. Job names are new; the required checks on main
+# ("pytest (unit)", "ruff + mypy", "lint + types + build", "gitleaks") live in
+# the ci-* workflows and are untouched.
+#
+# One-time setup (Settings -> Environments / Variables):
+#   Environment  aegis-hackathon   (add yourself as required reviewer if you
+#                                   want a click before every deploy)
+#   Variables    HACKATHON_AWS_ROLE_ARN    terraform output github_deploy_role_arn
+#                HACKATHON_AWS_REGION      us-west-2
+#                HACKATHON_ECR_REPOSITORY  terraform output ecr_repository_name
+#                HACKATHON_ECS_CLUSTER     terraform output ecs_cluster_name
+#                HACKATHON_API_BASE_URL    terraform output api_base_url
+#                HACKATHON_AEGIS_ENV       optional; "staging" if aegis_env was changed
+# Deliberately NOT the AWS_DEPLOY_ROLE_ARN / ECR_REPOSITORY_BACKEND variables
+# docker.yml and deploy-staging.yml read: setting those would arm the staging
+# pipeline against an account that has no staging environment.
+name: deploy-hackathon
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Image platform. MUST match cpu_architecture in the Terraform root."
+        type: choice
+        options: [arm64, amd64]
+        default: arm64
+      skip_migrations:
+        description: "Skip the one-off migration task (the app also migrates at boot behind an advisory lock)"
+        type: boolean
+        default: false
+      bring_up:
+        description: "First deploy or un-park: also set desired count to 1 on both services"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-hackathon
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.HACKATHON_AWS_REGION || 'us-west-2' }}
+  CLUSTER: ${{ vars.HACKATHON_ECS_CLUSTER }}
+  PREFIX: aegis-hackathon
+  IMAGE_TAG: ${{ github.sha }}
+  # Registers a new revision of FAMILY from its latest revision with only
+  # CONTAINER's image replaced, and prints the new ARN. Everything else - env,
+  # secrets, roles, sizing - is whatever Terraform last registered, so a config
+  # change applied with Terraform rides along with the next deploy. Kept inline
+  # (sourced by each step) so the workflow is one self-contained file.
+  REGISTER_FN: |
+    register() {
+      local family="$1" container="$2" image="$3"
+      aws ecs describe-task-definition --task-definition "${family}" --query taskDefinition --output json > "/tmp/${family}.json"
+      jq --arg c "${container}" --arg img "${image}" '
+        .containerDefinitions |= map(if .name == $c then .image = $img else . end)
+        | {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions,
+           volumes, placementConstraints, requiresCompatibilities, cpu, memory,
+           runtimePlatform}
+        | with_entries(select(.value != null))' "/tmp/${family}.json" > "/tmp/${family}.new.json"
+      aws ecs register-task-definition --cli-input-json "file:///tmp/${family}.new.json" --query taskDefinition.taskDefinitionArn --output text
+    }
+
+jobs:
+  # ----------------------------------------------------------------- build ---
+  build:
+    name: build and push image
+    # Native arm64 runners are free for public repositories; building arm64
+    # under QEMU on an x86 runner works but is several times slower.
+    runs-on: ${{ inputs.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    environment: aegis-hackathon
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in HACKATHON_AWS_ROLE_ARN HACKATHON_ECR_REPOSITORY HACKATHON_ECS_CLUSTER HACKATHON_API_BASE_URL; do
+            [ -n "${!v}" ] || missing+=("$v")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Missing repository variables::${missing[*]}"
+            exit 1
+          fi
+        env:
+          HACKATHON_AWS_ROLE_ARN: ${{ vars.HACKATHON_AWS_ROLE_ARN }}
+          HACKATHON_ECR_REPOSITORY: ${{ vars.HACKATHON_ECR_REPOSITORY }}
+          HACKATHON_ECS_CLUSTER: ${{ vars.HACKATHON_ECS_CLUSTER }}
+          HACKATHON_API_BASE_URL: ${{ vars.HACKATHON_API_BASE_URL }}
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HACKATHON_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-hackathon-build-${{ github.run_id }}
+
+      # An arm64 image on an X86_64 task definition (or the reverse) is an
+      # "exec format error" at start, which the circuit breaker then reverts.
+      # Cheaper to refuse here.
+      - name: Platform matches the task definitions
+        run: |
+          set -euo pipefail
+          arch="$(aws ecs describe-task-definition --task-definition "${PREFIX}-api" --query 'taskDefinition.runtimePlatform.cpuArchitecture' --output text)"
+          case "${arch}:${{ inputs.platform }}" in
+            ARM64:arm64|X86_64:amd64) echo "task definitions are ${arch}; building ${{ inputs.platform }}" ;;
+            *) echo "::error title=Platform mismatch::task definitions are ${arch} but platform=${{ inputs.platform }}. Change the input or cpu_architecture in Terraform."; exit 1 ;;
+          esac
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Image reference
+        id: ref
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.HACKATHON_ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          echo "image=${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          if aws ecr describe-images --repository-name "${REPOSITORY}" \
+               --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Build skipped::${REPOSITORY}:${IMAGE_TAG} is already in ECR (immutable tag)."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.ref.outputs.exists == 'false'
+
+      - name: Build (load locally for scanning)
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          platforms: linux/${{ inputs.platform }}
+          push: false
+          load: true
+          tags: aegis-backend:scan
+          provenance: false
+          cache-from: type=gha,scope=hackathon-backend-${{ inputs.platform }}
+          cache-to: type=gha,mode=max,scope=hackathon-backend-${{ inputs.platform }}
+
+      # Same gate as docker.yml: a HIGH/CRITICAL finding with a fix available
+      # never reaches the registry.
+      - name: Install Trivy
+        if: steps.ref.outputs.exists == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key |
+            gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" |
+            sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq trivy
+
+      - name: Scan image
+        if: steps.ref.outputs.exists == 'false'
+        run: trivy --quiet image aegis-backend:scan --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed
+
+      - name: Push
+        if: steps.ref.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker tag aegis-backend:scan "${IMAGE}"
+          docker push "${IMAGE}"
+          echo "pushed \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------- migrate ---
+  migrate:
+    name: run migrations
+    needs: build
+    if: ${{ !inputs.skip_migrations }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: aegis-hackathon
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HACKATHON_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-hackathon-migrate-${{ github.run_id }}
+
+      - name: Register migrate revision on the new image
+        id: taskdef
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          eval "${REGISTER_FN}"
+          arn="$(register "${PREFIX}-migrate" migrate "${IMAGE}")"
+          echo "arn=${arn}" >> "$GITHUB_OUTPUT"
+
+      # The network configuration is copied from the running API service rather
+      # than stored in a variable: the same subnets, the same security group
+      # and - because this environment has no NAT - the same public IP, without
+      # which the task could not pull its image or resolve its secret.
+      - name: Run migration task
+        env:
+          TASKDEF: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          set -euo pipefail
+          network="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${PREFIX}-api" \
+            --query 'services[0].networkConfiguration' --output json)"
+          task_arn="$(aws ecs run-task --cluster "${CLUSTER}" --task-definition "${TASKDEF}" \
+            --launch-type FARGATE --count 1 --network-configuration "${network}" \
+            --started-by "github-${GITHUB_RUN_ID}" --query 'tasks[0].taskArn' --output text)"
+          if [ -z "${task_arn}" ] || [ "${task_arn}" = "None" ]; then
+            echo "::error::run-task returned no task ARN"; exit 1
+          fi
+          task_id="${task_arn##*/}"
+          echo "migration task ${task_id}"
+
+          deadline=$(( $(date +%s) + 900 ))
+          status=""
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            status="$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${task_arn}" \
+              --query 'tasks[0].lastStatus' --output text)"
+            [ "${status}" = "STOPPED" ] && break
+            sleep 10
+          done
+          if [ "${status}" != "STOPPED" ]; then
+            aws ecs stop-task --cluster "${CLUSTER}" --task "${task_arn}" --reason "timed out in CI" >/dev/null || true
+            echo "::error::migration did not finish within 15 minutes"; exit 1
+          fi
+
+          echo "--- migrate logs ---"
+          aws logs get-log-events --log-group-name "/aegis/hackathon" \
+            --log-stream-name "migrate/migrate/${task_id}" --limit 500 --start-from-head \
+            --query 'events[].message' --output text 2>/dev/null || echo "(log stream not available)"
+          echo "--- end logs ---"
+
+          read -r exit_code reason <<<"$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${task_arn}" \
+            --query 'tasks[0].[containers[0].exitCode,stoppedReason]' --output text)"
+          if [ "${exit_code}" != "0" ]; then
+            echo "::error title=Migration failed::exit ${exit_code} (${reason})"; exit 1
+          fi
+
+  # ---------------------------------------------------------------- deploy ---
+  deploy:
+    name: roll out services
+    needs: [build, migrate]
+    # Runs after a successful migration, or when migrations were skipped.
+    if: ${{ always() && needs.build.result == 'success' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: aegis-hackathon
+      url: ${{ vars.HACKATHON_API_BASE_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HACKATHON_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aegis-hackathon-deploy-${{ github.run_id }}
+
+      # Printed first, so a failed rollout still leaves the way back on screen.
+      - name: Record rollback target
+        run: |
+          set -euo pipefail
+          {
+            echo "### Rollback target"
+            echo '```'
+            for svc in api worker; do
+              rev="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${PREFIX}-${svc}" \
+                --query 'services[0].taskDefinition' --output text)"
+              echo "aws ecs update-service --cluster ${CLUSTER} --service ${PREFIX}-${svc} --task-definition ${rev##*/}"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # bring_up exists for the first deploy: Terraform is applied with both
+      # services at zero (the "bootstrap" tag has no image, so running tasks
+      # would only crash-loop), and this run starts them on a real image.
+      - name: Register and roll
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          BRING_UP: ${{ inputs.bring_up }}
+        run: |
+          set -euo pipefail
+          eval "${REGISTER_FN}"
+          count_args=()
+          if [ "${BRING_UP}" = "true" ]; then count_args=(--desired-count 1); fi
+          for svc in api worker; do
+            arn="$(register "${PREFIX}-${svc}" "${svc}" "${IMAGE}")"
+            echo "${svc}: ${arn##*/}"
+            aws ecs update-service --cluster "${CLUSTER}" --service "${PREFIX}-${svc}" \
+              --task-definition "${arn}" "${count_args[@]}" \
+              --query 'service.deployments[0].id' --output text
+          done
+
+      # The deployment circuit breaker rolls a failing rollout back on its own;
+      # this wait turns that into a red job instead of a silent revert.
+      - name: Wait for a steady state
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "${CLUSTER}" --services "${PREFIX}-api" "${PREFIX}-worker"
+          for svc in api worker; do
+            aws ecs describe-services --cluster "${CLUSTER}" --services "${PREFIX}-${svc}" \
+              --query 'services[0].{service:serviceName,taskDefinition:taskDefinition,running:runningCount,rollout:deployments[0].rolloutState}' \
+              --output table
+          done
+          # A rollout the circuit breaker reverted also ends "stable" - on the OLD
+          # revision. Assert the new one is what is running.
+          want="$(aws ecs describe-task-definition --task-definition "${PREFIX}-api" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)"
+          have="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${PREFIX}-api" \
+            --query 'services[0].taskDefinition' --output text)"
+          if [ "${want}" != "${have}" ]; then
+            echo "::error title=Rolled back::API is on ${have##*/}, expected ${want##*/}. The circuit breaker reverted the deploy; read the api/ log stream."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- verify ---
+  verify:
+    name: health check
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Through CloudFront, as a browser sees it: liveness, readiness (Postgres),
+      # environment identity, anonymous reads refused, untokened ingest refused.
+      - name: Smoke test
+        run: bash scripts/ci/smoke-test.sh "${{ vars.HACKATHON_API_BASE_URL }}" "${{ vars.HACKATHON_AEGIS_ENV || 'production' }}"
+
+      - name: Edge refuses /metrics
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${{ vars.HACKATHON_API_BASE_URL }}/metrics")"
+          if [ "${code}" != "404" ]; then
+            echo "::error::/metrics answered ${code} through the edge; expected 404"; exit 1
+          fi
+          echo "/metrics -> 404"

@@ -38,13 +38,17 @@ from aegis.core.logging import (
 from aegis.domain.enums import IncidentState
 from aegis.persistence.db import Database
 from aegis.persistence.incidents import IncidentRepository
-from aegis.persistence.jobs import JobQueue
+from aegis.persistence.jobs import RENEW_INTERVAL_S, JobQueue
 from aegis.persistence.migrate import run_migrations
 
 log = get_logger(__name__)
 
 POLL_INTERVAL_S = 2.0
-REAP_INTERVAL_S = 120.0
+# Reap once per two renewals: a lapsed lease is noticed within a minute of
+# expiring, and the reaper's UPDATE stays off the hot path.
+REAP_EVERY_TICKS = 2
+# Under ECS's 120 s stopTimeout, leaving time to hand jobs back.
+DRAIN_TIMEOUT_S = 90.0
 
 
 async def _diagnosis_confidence(db: Database, incident_id: str) -> float:
@@ -162,22 +166,42 @@ class Worker:
     async def _shutdown(self) -> None:
         if self._inflight:
             log.info("draining", jobs=len(self._inflight))
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+            _done, pending = await asyncio.wait(self._inflight, timeout=DRAIN_TIMEOUT_S)
+            if pending:
+                # Out of time (ECS stops a task 120 s after SIGTERM, Spot gives
+                # no more). Hand the unfinished jobs back rather than holding
+                # them until the lease expires: each one resumes from its last
+                # checkpoint on whichever worker claims it next.
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                with contextlib.suppress(Exception):
+                    released = await JobQueue(self._db).reclaim_own(self.worker_id)
+                    log.warning("released unfinished jobs on shutdown", jobs=released)
         if self._horizon is not None:
             await self._horizon.aclose()
         await self._container.aclose()
         log.info("worker stopped", worker_id=self.worker_id)
 
     async def _reap_loop(self) -> None:
-        """Requeue jobs orphaned by a dead worker."""
+        """Renew this worker's job leases; requeue jobs whose lease lapsed.
+
+        Renewal and reaping share a loop so that a worker which stops renewing
+        - because it is wedged or gone - is exactly the one whose jobs the
+        others reclaim.
+        """
         queue = JobQueue(self._db)
+        tick = 0
         while not self._stopping.is_set():
             try:
-                await queue.reap_stale()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("reaper failed", error=str(exc))
+                await queue.renew(self.worker_id)
+                if tick % REAP_EVERY_TICKS == 0:
+                    await queue.reap_stale()
+            except Exception as exc:  # noqa: BLE001 - retried next tick
+                log.warning("job lease maintenance failed", error=str(exc))
+            tick += 1
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._stopping.wait(), timeout=REAP_INTERVAL_S)
+                await asyncio.wait_for(self._stopping.wait(), timeout=RENEW_INTERVAL_S)
 
     async def _poll_loop(self) -> None:
         queue = JobQueue(self._db)

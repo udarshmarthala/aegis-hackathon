@@ -31,9 +31,12 @@ cpu_architecture = "ARM64"
 # stalls that incident until the 15-minute stale-job reaper requeues it.
 worker_use_spot = true
 
-# Park the environment by setting both to 0 (RDS and the ALB keep billing).
-api_desired_count    = 1
-worker_desired_count = 1
+# FIRST apply: 0 and 0 - the "bootstrap" tag has no image, so running tasks
+# would only crash-loop. The first deploy-hackathon run with bring_up=true
+# starts both. Afterwards 1 and 1; set both back to 0 to park the environment
+# (RDS and the ALB keep billing).
+api_desired_count    = 0
+worker_desired_count = 0
 
 bedrock_model_id          = "us.anthropic.claude-sonnet-5"
 bedrock_fallback_model_id = "us.anthropic.claude-sonnet-4-6"

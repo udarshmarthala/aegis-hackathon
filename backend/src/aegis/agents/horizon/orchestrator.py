@@ -312,6 +312,10 @@ class HorizonOrchestrator:
     def __init__(self, deps: HorizonDeps) -> None:
         self._d = deps
         self._s = deps.settings
+        # Last fallback reason announced per run. A standing fallback (a model
+        # the account cannot use) is one fact, not one event per step; the
+        # count still rises in TokenStats every time it is used.
+        self._announced_fallback: dict[str, str] = {}
         self._observer = Observer(
             store=deps.store,
             compactor=deps.compactor,
@@ -612,7 +616,11 @@ class HorizonOrchestrator:
                 "cache_read_tokens": decision.cache_read_tokens,
             },
         )
-        if decision.fallback_reason:
+        if (
+            decision.fallback_reason
+            and self._announced_fallback.get(state.run_id) != decision.fallback_reason
+        ):
+            self._announced_fallback[state.run_id] = decision.fallback_reason
             await self._emit(
                 state,
                 HorizonEventType.BRAIN_FALLBACK,

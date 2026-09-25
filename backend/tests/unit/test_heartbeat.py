@@ -436,3 +436,25 @@ async def test_a_pass_that_raises_an_unexpected_type_does_not_end_detection() ->
 
     assert calls["n"] >= 3
     assert hb.last_error is not None and "RuntimeError" in hb.last_error
+
+
+async def test_one_fault_seen_on_several_services_opens_one_incident_at_the_origin() -> None:
+    # The leaking service saturates; its caller only echoes errors. Two
+    # incidents for one fault would split the investigation in half.
+    rows = [
+        {"service": "gateway", "metric": "error_rate", "recent_value": 0.9,
+         "baseline_mean": 0.01, "baseline_std": 0.01, "z": 60.0},
+        {"service": "checkout", "metric": "error_rate", "recent_value": 0.9,
+         "baseline_mean": 0.01, "baseline_std": 0.01, "z": 55.0},
+        {"service": "checkout", "metric": POOL_UTILISATION, "recent_value": 1.0,
+         "baseline_mean": 0.1, "baseline_std": 0.05, "z": 18.0},
+    ]
+    result = QueryResult(name="anomaly_detect", sql="...", rows=rows, source=Source.RAWTREE)
+    _w, _clock, _rt, _fwd, hb, seen = _heartbeat(read=True, result=result)
+
+    fired = await hb.check_once()
+
+    assert len(fired) == 1 and seen == fired
+    assert fired[0].service == "checkout"
+    assert fired[0].related == ("gateway",)
+    assert await hb.check_once() == []  # both services debounced

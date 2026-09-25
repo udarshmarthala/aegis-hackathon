@@ -26,7 +26,7 @@ import statistics
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any, Final
 
@@ -311,6 +311,9 @@ class Anomaly:
     z: float
     source: Source  # rawtree | zscore
     detected_at: datetime
+    # Other services anomalous in the same pass. One fault shows up everywhere
+    # downstream of it; they belong to one incident, not one each.
+    related: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -411,12 +414,17 @@ class Heartbeat:
                 log.info("heartbeat anomaly cleared", service=service)
                 del self.open[service]
 
+        fresh = [
+            a for a in sorted(candidates, key=lambda a: -a.z) if a.service not in self.open
+        ]
         emitted: list[Anomaly] = []
-        for anomaly in sorted(candidates, key=lambda a: -a.z):
-            if anomaly.service in self.open:
-                continue  # debounced: one open anomaly per service
-            self.open[anomaly.service] = anomaly
-            emitted.append(anomaly)
+        if fresh:
+            for anomaly in fresh:
+                self.open[anomaly.service] = anomaly  # debounced per service
+            primary = _primary(fresh)
+            related = tuple(sorted({a.service for a in fresh} - {primary.service}))
+            emitted.append(replace(primary, related=related))
+        for anomaly in emitted:
             log.warning(
                 "heartbeat anomaly",
                 service=anomaly.service,
@@ -452,6 +460,17 @@ class Heartbeat:
                 await asyncio.wait_for(stop.wait(), timeout=remaining)
 
 
+def _primary(anomalies: list[Anomaly]) -> Anomaly:
+    """The service to open the incident against when several fire together.
+
+    Saturation is a cause-side signal: the service whose own pool is filling is
+    far more often the origin than the callers timing out on it, whose errors
+    and latency merely echo it. Among equals, the strongest deviation wins.
+    """
+    saturated = [a for a in anomalies if a.metric == POOL_UTILISATION]
+    return max(saturated or anomalies, key=lambda a: a.z)
+
+
 def _from_row(row: dict[str, Any], now: datetime) -> Anomaly | None:
     try:
         return Anomaly(
@@ -480,6 +499,9 @@ HEARTBEAT_SOURCE: Final = "heartbeat"
 # same service. Longer than any single investigation's quiet spell, far shorter
 # than the gap between two separate faults.
 ANOMALY_DEDUPE_WINDOW_S: Final = 1800
+# How soon after a heartbeat-opened incident another service's anomaly is
+# treated as the same fault surfacing downstream.
+ANOMALY_CORRELATION_WINDOW_S: Final = 180
 
 
 async def open_incident_from_anomaly(
@@ -514,7 +536,9 @@ async def open_incident_from_anomaly(
 
     async with db.transaction() as conn:
         await conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext($1))", f"heartbeat:{anomaly.service}"
+            # One lock for every service: correlation below compares against
+            # incidents opened for *other* services moments ago.
+            "SELECT pg_advisory_xact_lock(hashtext($1))", "heartbeat:open"
         )
         existing = await conn.fetchval(
             """
@@ -532,11 +556,40 @@ async def open_incident_from_anomaly(
             anomaly.service,
             ANOMALY_DEDUPE_WINDOW_S,
         )
+        if existing is None:
+            # A fault announces itself on its callers a pass or two after its
+            # origin. An anomaly arriving within the correlation window of a
+            # heartbeat-opened incident joins it rather than opening a second
+            # investigation of the same failure. Two unrelated faults inside
+            # the window are merged; the investigation then sees both services.
+            existing = await conn.fetchval(
+                """
+                SELECT i.id FROM incidents i
+                 WHERE i.resolved_at IS NULL
+                   AND i.created_at > now() - make_interval(secs => $2)
+                   AND EXISTS (SELECT 1 FROM incident_alerts a
+                                WHERE a.incident_id = i.id AND a.source = $1)
+                 ORDER BY i.created_at DESC LIMIT 1
+                """,
+                HEARTBEAT_SOURCE,
+                ANOMALY_CORRELATION_WINDOW_S,
+            )
         if existing is not None:
+            await conn.execute(
+                """
+                UPDATE incidents
+                   SET affected_services = ARRAY(
+                       SELECT DISTINCT unnest(affected_services || $2::text[]))
+                 WHERE id = $1
+                """,
+                existing,
+                [anomaly.service, *anomaly.related],
+            )
             log.info(
                 "heartbeat anomaly attached to open incident",
                 incident_id=existing,
                 service=anomaly.service,
+                related=list(anomaly.related),
             )
             return None
 
@@ -551,7 +604,7 @@ async def open_incident_from_anomaly(
         await conn.execute(
             "UPDATE incidents SET affected_services = $2 WHERE id = $1",
             incident.id,
-            [anomaly.service],
+            [anomaly.service, *anomaly.related],
         )
         alert_id = f"alr_{correlation_id()}"
         await conn.execute(

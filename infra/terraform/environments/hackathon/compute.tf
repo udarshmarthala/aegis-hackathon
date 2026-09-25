@@ -57,6 +57,10 @@ locals {
     LANGSMITH_TRACING        = "false"
 
     FIREBASE_PROJECT_ID = var.firebase_project_id
+
+    # Forward-looking, like AEGIS_QUEUE_URL in modules/compute: nothing reads
+    # it yet (settings ignore unknown keys); the S3 archive writer will.
+    AEGIS_ARTIFACTS_BUCKET = aws_s3_bucket.artifacts.bucket
   }, var.extra_environment_variables)
 
   db_password_secret = [{
@@ -134,6 +138,21 @@ resource "aws_ecs_cluster" "this" {
   }
 
   tags = merge(local.tags, { component = "compute" })
+
+  depends_on = [aws_iam_service_linked_role.ecs]
+}
+
+# The account has never run ECS (AWSServiceRoleForECS did not exist on
+# 2026-09-26). CreateCluster creates it implicitly, but asynchronously, and a
+# capacity-provider association or service created in the same apply can race
+# it and fail with "unable to assume the service linked role". Creating it
+# explicitly first removes the race. If the role exists by the time you apply
+# (another tool created it), import it:
+#   terraform import aws_iam_service_linked_role.ecs \
+#     arn:aws:iam::<account>:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS
+resource "aws_iam_service_linked_role" "ecs" {
+  aws_service_name = "ecs.amazonaws.com"
+  description      = "ECS service-linked role, created ahead of the first cluster."
 }
 
 resource "aws_ecs_cluster_capacity_providers" "this" {

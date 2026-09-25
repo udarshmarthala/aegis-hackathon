@@ -455,14 +455,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _llm_configured(self) -> Settings:
-        """At least one Gemini key must exist in production.
+        """At least one model - Bedrock or a Gemini key - must exist in production.
 
         Locally an unconfigured model is a legitimate state: investigations
         still collect evidence and then abstain, which is the designed
         behaviour rather than a crash.
         """
-        if not self.google_api_keys and self.is_production:
-            raise ValueError("no GOOGLE_API_KEY is configured")
+        # Bedrock counts: the brain runs on it, and on ECS it authenticates
+        # with the task role, so it needs no key in this file at all.
+        bedrock = bool(self.bedrock_model_id and self.aws_region)
+        if not self.google_api_keys and not bedrock and self.is_production:
+            raise ValueError("no LLM is configured: set BEDROCK_MODEL_ID or GOOGLE_API_KEY")
         return self
 
 

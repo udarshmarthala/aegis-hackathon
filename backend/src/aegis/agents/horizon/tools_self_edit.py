@@ -75,10 +75,17 @@ SPECS: Final[dict[str, ToolSpec]] = {
                         "type": "object",
                         "properties": {
                             "id": {"type": ["string", "null"]},
-                            "statement": {"type": "string"},
+                            "statement": {"type": "string", "maxLength": 240},
                             "supporting": _STR_IDS,
                             "refuting": _STR_IDS,
-                            "suggested_action": {"type": ["string", "null"]},
+                            # The closed vocabulary, stated in the schema: a
+                            # prose remedy here is rejected by the validator,
+                            # and listing the legal values stops the model
+                            # spending a step to learn that.
+                            "suggested_action": {
+                                "type": ["string", "null"],
+                                "enum": [*sorted(a.value for a in ActionType), None],
+                            },
                         },
                         "required": [
                             "id",
