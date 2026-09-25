@@ -76,10 +76,21 @@ function GraphConsole() {
     staleTime: 60_000,
   });
 
-  const serviceRows = useMemo(
-    () => (services.data && isAvailable(services.data) ? services.data.items : []),
-    [services.data],
-  );
+  // Topology outlives the runtime adapter's reach: when no runtime inventory
+  // is available, pick from the services the graph itself knows.
+  const runtimeUnavailable = services.data !== undefined && !isAvailable(services.data);
+  const graphServices = useQuery({
+    queryKey: ['graph', 'services'],
+    queryFn: () => consoleApi.graphServices(),
+    enabled: runtimeUnavailable,
+    staleTime: 60_000,
+  });
+
+  const serviceRows = useMemo((): Array<{ service_id: string; name: string; health?: string }> => {
+    if (services.data && isAvailable(services.data)) return services.data.items;
+    if (graphServices.data && isAvailable(graphServices.data)) return graphServices.data.items;
+    return [];
+  }, [services.data, graphServices.data]);
 
   useEffect(() => {
     if (serviceId !== '') return;
@@ -281,7 +292,7 @@ function GraphConsole() {
             onRetry={() => services.refetch()}
           />
         </div>
-      ) : services.data && !isAvailable(services.data) ? (
+      ) : services.data && !isAvailable(services.data) && serviceRows.length === 0 ? (
         <div className="mb-4">
           <SourceUnavailableState
             source="Service inventory"
@@ -339,7 +350,8 @@ function GraphConsole() {
                       {row.name}
                     </span>
                     <span className="shrink-0 text-meta font-semibold uppercase tracking-wider text-ink-tertiary">
-                      {row.health}
+                      {/* Graph-sourced rows carry no runtime health: say where they came from. */}
+                      {row.health ?? 'from topology'}
                     </span>
                   </li>
                 ))}

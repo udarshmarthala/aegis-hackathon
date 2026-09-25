@@ -69,6 +69,9 @@ export const consoleApi = {
       '/v1/systems/health',
     ),
 
+  graphServices: () =>
+    request<Availability<Listed<{ service_id: string; name: string }>>>('/v1/graph/services'),
+
   neighbourhood: (serviceId: string, depth = 2) =>
     request<Availability<Neighbourhood>>(
       `/v1/graph/neighbourhood${qs({ service_id: serviceId, depth })}`,

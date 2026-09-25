@@ -27,6 +27,36 @@ def _unavailable(reason: str) -> dict[str, Any]:
     return {"available": False, "reason": reason, "nodes": [], "edges": []}
 
 
+# Fixed query, no caller input, hard LIMIT: the picker needs names, not a scan.
+_LIST_SERVICES = (
+    "MATCH (s:Service) RETURN s.service_id AS service_id, "
+    "coalesce(s.name, s.service_id) AS name ORDER BY name LIMIT 200"
+)
+
+
+@router.get("/services", summary="Services known to the topology graph")
+async def services(_: RequireViewer, container: ContainerDep) -> dict[str, Any]:
+    """The graph's own service list, for when no runtime inventory is reachable.
+
+    Topology is a projection that can outlive the runtime adapter's reach (a
+    cloud deployment observing a workload it cannot list). Without this the
+    picker is empty although every topology query below would answer.
+    """
+    client = getattr(container, "neo4j", None)
+    if client is None:
+        return {"available": False, "reason": "no graph client is configured", "items": []}
+    try:
+        rows = await client.run(_LIST_SERVICES, {})
+    except SourceUnavailable as exc:
+        return {"available": False, "reason": str(exc), "items": []}
+    items = [
+        {"service_id": str(r["service_id"]), "name": str(r["name"])}
+        for r in rows
+        if r.get("service_id")
+    ]
+    return {"available": True, "reason": "", "items": items}
+
+
 @router.get("/neighbourhood", summary="Service graph around one service")
 async def neighbourhood(
     _: RequireViewer,
