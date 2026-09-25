@@ -40,9 +40,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
@@ -50,7 +50,7 @@ jobs:
       - name: terraform fmt -check
         run: terraform fmt -recursive -check -diff infra/terraform
 
-      - uses: terraform-linters/setup-tflint@v4
+      - uses: terraform-linters/setup-tflint@v6
         with:
           tflint_version: v0.54.0
 
@@ -74,9 +74,9 @@ jobs:
           - infra/terraform/environments/staging
           - infra/terraform/environments/production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
@@ -101,7 +101,7 @@ jobs:
       id-token: write          # OIDC token for AWS role assumption
       pull-requests: write     # to post the plan comment
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A repository without AWS wiring must not fail this job. The gate
       # publishes an explicit skip rather than silently passing.
@@ -119,7 +119,7 @@ jobs:
 
       - name: Configure AWS credentials (OIDC)
         if: steps.gate.outputs.configured == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -128,7 +128,7 @@ jobs:
           # assumed with a short-lived OIDC token scoped to this repo.
           role-duration-seconds: 1800
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         if: steps.gate.outputs.configured == 'true'
         with:
           terraform_version: ${{ env.TF_VERSION }}
@@ -180,7 +180,7 @@ jobs:
       # become JavaScript in a privileged workflow.
       - name: Comment plan on PR
         if: always() && steps.gate.outputs.configured == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PLAN_TEXT: ${{ steps.plan.outputs.summary }}
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
