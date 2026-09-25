@@ -269,7 +269,7 @@ services:
       - "4318:4318"
 
   prometheus:
-    image: prom/prometheus:v3.0.1
+    image: prom/prometheus:v3.14.0
     <<: *restart
     profiles: ["observability"]
     command:
