@@ -55,7 +55,7 @@ jobs:
             repo_var: ECR_REPOSITORY_WEB
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # semver-ish: the product version from pyproject.toml, the monotonic run
       # number so two builds of the same version are orderable, and the short
@@ -71,7 +71,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         id: aws
         if: vars.AWS_DEPLOY_ROLE_ARN != ''
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -83,13 +83,13 @@ jobs:
         if: vars.AWS_DEPLOY_ROLE_ARN != ''
         uses: aws-actions/amazon-ecr-login@v2
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Fargate on x86 by default. ARM64 Fargate is ~20% cheaper per vCPU-hour
       # (docs/cost-strategy.md); switching means building on arm64 runners AND
       # flipping cpu_architecture in the compute module. Both or neither.
       - name: Build (load locally for scanning)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
