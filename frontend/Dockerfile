@@ -3,13 +3,13 @@
 # server bundle and its traced dependencies, not the whole node_modules tree.
 
 # ---------- deps -------------------------------------------------------------
-FROM node:22-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --no-audit --no-fund
 
 # ---------- builder ----------------------------------------------------------
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -42,7 +42,7 @@ ENV BUILD_STANDALONE=$BUILD_STANDALONE \
 RUN npm run build
 
 # ---------- runtime ----------------------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production \
